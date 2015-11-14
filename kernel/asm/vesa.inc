@@ -1,3 +1,5 @@
+; graphic card info structures - address definitions
+
 ABSOLUTE 0x5000
 VBECardInfo:
 	.signature resb 4
@@ -78,7 +80,7 @@ VBEEDID:
 	.timingII	resb 1
 	.timingreserved	resb 1
 	.standardtiming:	resw 8	;format: db (horizontal-248)/8, aspectratio | verticalfrequency - 60
-		.aspect.16.10	equ 0 	;mul horizontal by 10, shr 4 to get vertical resolution
+		.aspect.16.10	equ 0 	;mul horizontal by 5, shr 3 to get vertical resolution (16:10 = 8:5)
 		.aspect.4.3	equ 1 << 6	;mul horizontal by 3, shr 2 to get vertical resolution
 		.aspect.5.4	equ 2 << 6	;shl horizontal by 2, div by 5 to get vertical resolution
 		.aspect.16.9	equ 3 << 6	;mul horizontal by 9, shr by 4 to get vertical resolution

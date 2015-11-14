@@ -3,79 +3,129 @@
 [BITS 16]
 vesa:
 .getcardinfo:
+	; Get SuperVGA information
+	; ax = 4F00
+	; es:di - pointer to buffer
 	mov ax, 0x4F00
 	mov di, VBECardInfo
 	int 0x10
+
+	; if ok, ax should be 4F
 	cmp ax, 0x4F
 	je .edid
+
+	; error
 	mov eax, 1
 	ret
+
 .edid:
-	cmp dword [.required], 0	;if both required x and required y are set, forget this
+	; info filled, check for EDID
+	cmp dword [.required], 0	; if both required x and required y are set, forget this
 	jne near .findmode
+	; Read Extended Display Identification Data (EDID)
+	; ax = 4F15
+	; bl = 1
+	; es:di = EDID buffer
 	mov ax, 0x4F15
 	mov bl, 1
 	mov di, VBEEDID
-	int 0x10
+	int 0x10	; call function
+
+	; if ok, ax should be 4F
 	cmp ax, 0x4F
 	jne near .noedid
-	xor di, di
+
+	xor di, di	; zero di
 .lp:
 	xor cx, cx
+	; read first byte of standard timing info into cl
 	mov cl, [di+VBEEDID.standardtiming]
+	; compute horizontal resolution
 	shl cx, 3
 	add cx, 248
 	push ecx
+
+	; print it
 	call decshowrm
-	mov al, 'x'
+
+	; print 'x'
+	mov al, 'x'	
 	call charrm
+
 	pop ecx
-	mov bx, cx
-	inc di
-	mov al, [di+VBEEDID.standardtiming]
-	and al, 11000000b
+	mov bx, cx	; cx and bx now hold the horizontal resolution
+	inc di	; move di to point to aspect ratio
+	mov al, [di+VBEEDID.standardtiming]	; load it into al
+	and al, 11000000b	; extract the leftmost 2 bits
+
+	; now we compute vertical resolution based on horizontal and aspect ratio
+
+	; check if 4:3
 	cmp al, VBEEDID.aspect.4.3
 	jne .not43
+
+	; it's 4:3, we multiply cx by 3 and divide by 4 (= shr 2)
 	mov ax, 3
 	mul cx
 	mov cx, ax
 	shr cx, 2
 	jmp .gotres
+
 .not43:
+	; not 4:3, check 5:4
 	cmp al, VBEEDID.aspect.5.4
 	jne .not54
+
+	; it's 5:4, multiply cx by 4 (= shl 2) and divide by 5
 	shl cx, 2
 	mov ax, cx
 	mov cx, 5
-	xor dx, dx
+	xor dx, dx	; now dx:ax hold 4x[hor. res.] (required for 16-bit division)
 	div cx
-	mov cx, ax
+	mov cx, ax	; copy result back to cx
 	jmp .gotres
+
 .not54:
+	; not 5:4, check 16:10
 	cmp al, VBEEDID.aspect.16.10
 	jne .not1610
-	mov ax, 10
+
+	; it's 16:10, multiply by 5 and divide by 8 (= shr 3)
+	mov ax, 5
 	mul cx
 	mov cx, ax
-	shr cx, 4
+	shr cx, 3
 	jmp .gotres
+
 .not1610:
+	; not 16:10, it has to be 16:9 so multiply by 9 and divide by 16 (= shr 4)
 	mov ax, 9
 	mul cx
 	mov cx, ax
 	shr cx, 4
+
+; now we have horizontal resolution in bx and vertical in cx
 .gotres:
-	call decshowrm
+	call decshowrm 	; print vertical resolution
+	; print " is supported"
 	mov si, .edidmsg
 	call printrm
+
+	; increase di to point to the next record
 	inc di
+
+	; go to the beginning, unless we left the struct
 	cmp di, 8
 	jb .lp
+
 	jmp .findmode
+
 .noedid:
+	; EDID not supported, print info
 	mov si, .noedidmsg
 	call printrm
 	jmp .findmode
+
  .resetlist:
 	;if needed, reset mins/maxes/stuff
 	xor cx, cx
@@ -84,95 +134,145 @@ vesa:
 	mov [.requiredx], cx
 	mov [.requiredy], cx
 	mov [.requiredmode], cx
+
 .findmode:
+	; load segment and offset of video mode
 	mov	si, [VBECardInfo.videomodeptr]
 	mov ax, [VBECardInfo.videomodeptr+2]
 	mov fs, ax
-	sub si, 2
+	sub si, 2	; to balance adding 2 below
+	; if requiredmode is nonzero, we just assume we found it and it's ok
 	mov cx, [.requiredmode]
 	test cx, cx
 	jnz .getmodeinfo
 .searchmodes:
-	add si, 2
-	mov cx, [fs:si]
-	cmp cx, 0xFFFF
-	jne .getmodeinfo
+	add si, 2	; go to the next record
+	mov cx, [fs:si]	; read mode code
+	cmp cx, 0xFFFF	; FFFF means it's the end of the list
+	jne .getmodeinfo ; if list is not finished, read mode info
+
+	; if goodmode is still 0, we reset everything
 	cmp word [.goodmode], 0
 	je .resetlist
-	jmp .findmode
+	jmp .findmode	; we traversed the entire list, back to the beginning
 .getmodeinfo:
 	push esi
-	;or cx, 1 << 14
+	; read information about mode
+	; cx = mode code
+	; ax = 4F01
+	; es:di = buffer
 	mov [.currentmode], cx
 	mov ax, 0x4F01
 	mov di, VBEModeInfo
-	int 0x10
+	int 0x10	; call function
+
 	pop esi
+	; if ok, ax should be 4F
 	cmp ax, 0x4F
 	je .foundmode
+
+	; error
 	mov eax, 1
 	ret
+
 .foundmode:
-	;check minimum values, really not minimums from an OS perspective but ugly for users
+	; a mode was found, check its properties
+	; check minimum values, really not minimums from an OS perspective but ugly for users
+
+	; if color depth below 32 bits, we continue searching
 	cmp byte [VBEModeInfo.bitsperpixel], 32
 	jb .searchmodes
+
 .testx:
 	mov cx, [VBEModeInfo.xresolution]
+	; if we require some x resolution, check it, else continue
 	cmp word [.requiredx], 0
 	je .notrequiredx
+
+	; check if the resolution equals required
 	cmp cx, [.requiredx]
 	je .testy
+	; if not, continue searching
 	jmp .searchmodes
+
 .notrequiredx:
+	; if below minimum, continue searching
 	cmp cx, [.minx]
 	jb .searchmodes
+
 .testy:
 	mov cx, [VBEModeInfo.yresolution]
+	; if we require some y resolution, check it, else continue
 	cmp word [.requiredy], 0
 	je .notrequiredy
+
+	; check if the resolution equals required
 	cmp cx, [.requiredy]
-	jne .searchmodes	;as if there weren't enough warnings, USE WITH CAUTION
+	; if not, continue searching
+	jne .searchmodes	; as if there weren't enough warnings, USE WITH CAUTION
+	; if x was also required, everything ok, go to setting the mode
 	cmp word [.requiredx], 0
 	jnz .setmode
+	; if x was not required, we just handle this mode as an appropriate one
 	jmp .testgood
+
 .notrequiredy:
+	; if below minimum, continue searching
 	cmp cx, [.miny]
 	jb .searchmodes
+
 .testgood:
+	; mode passed initial tests
 	mov cx, [.currentmode]
-	mov [.goodmode], cx
+	mov [.goodmode], cx	; save it as a good one
+
+	; print mode info
 	push esi
-	mov cx, [VBEModeInfo.xresolution]
+	mov cx, [VBEModeInfo.xresolution]	; horizontal res
 	call decshowrm
 	mov al, 'x'
 	call charrm
-	mov cx, [VBEModeInfo.yresolution]
+	mov cx, [VBEModeInfo.yresolution]	; vertical res
 	call decshowrm
 	mov al, '@'
 	call charrm
 	xor ch, ch
-	mov cl, [VBEModeInfo.bitsperpixel]
+	mov cl, [VBEModeInfo.bitsperpixel]	; bits per pixel
 	call decshowrm
+
+	; print "Is this OK?"
 	mov si, .modeok
 	call printrm
+
+	; read a character from the keyboard
 	xor ax, ax
 	int 0x16
 	pop esi
+	; if the character is not 'y' (meaning ok), continue searching
 	cmp al, 'y'
 	jne .searchmodes
+
 .setmode:
+	; mode is chosen, now set it
 	mov bx, [.currentmode]
 	cmp bx, 0
-	je .nomode
+	je .nomode	; somehow we got here without choosing a mode
+
+	; set the mode
 	or bx, 0x4000
 	mov ax, 0x4F02
 	int 0x10
 .nomode:
+	; if everything went ok, ax should be 4F
 	cmp ax, 0x4F
 	je .returngood
+
+	; error
 	mov eax, 1
 	ret
+
 .returngood:
+	; zero eax and return
 	xor eax, eax
 	ret
 
@@ -189,112 +289,51 @@ vesa:
 
 .goodmode dw 0
 .currentmode dw 0
-;useful functions
 
+; useful functions
+
+; print number as decimal
+; cx - number to print
 decshowrm:
-	mov si, .number
-.clear:
-	mov al, "0"
-	mov [si], al
-	inc si
-	cmp si, .numberend
-	jb .clear
-	dec si
-	call convertrm
-	mov si, .number
+	mov ax, cx
+	push cx
+	mov cl, 10	; we will be dividing by that
+	push word 0	; this will mark that we should stop popping
 .lp:
-	lodsb
-	cmp si, .numberend
-	jae .end
-	cmp al, "0"
-	jbe .lp
-.end:
-	dec si
-	call printrm
-	ret
-
-.number times 7 db 0
-.numberend db 0
-
-convertrm:
-	dec si
-	mov bx, si		;place to convert into must be in si, number to convert must be in cx
-.cnvrt:
-	mov si, bx
-	sub si, 4
-.ten4:	inc si
-	cmp cx, 10000
-	jb .ten3
-	sub cx, 10000
-	inc byte [si]
-	jmp .cnvrt
-.ten3:	inc si
-	cmp cx, 1000
-	jb .ten2
-	sub cx, 1000
-	inc byte [si]
-	jmp .cnvrt
-.ten2:	inc si
-	cmp cx, 100
-	jb .ten1
-	sub cx, 100
-	inc byte [si]
-	jmp .cnvrt
-.ten1:	inc si
-	cmp cx, 10
-	jb .ten0
-	sub cx, 10
-	inc byte [si]
-	jmp .cnvrt
-.ten0:	inc si
-	cmp cx, 1
-	jb .return
-	sub cx, 1
-	inc byte [si]
-	jmp .cnvrt
+	div cl	; now al = ax/10, ah = ax % 10
+	add ah, '0'	; convert ah to a digit
+	push ax		; and push it on the stack
+	xor ah, ah	; now ax = al = previous ax / 10
+	cmp ax, 0	; if we reached 0, we can start printing
+	je .print
+	jmp .lp		; if not, calculate next digit
+.print:
+	pop ax		; pop previously saved digit
+	xchg al, ah	; now the digit is in al
+	test al, al	; check if 0
+	jz .return	; if yes, we finished printing
+	call charrm ; print character
+	jmp .print  ; and loop
 .return:
+	pop cx
 	ret
 
+
+; printing function
+; si - address of the null-terminated string to print
 printrm:
-	mov al, [si]
-	test al, al
-	jz .return
-	call charrm
-	inc si
-	jmp printrm
+	mov al, [si]	; load current character into al
+	test al, al		; check if it's 0
+	jz .return		; if 0, return
+	call charrm 	; print character
+	inc si			; go to the next one
+	jmp printrm 	; and loop
 .return:
 	ret
 
-charrm: 		    ;char must be in al
+; print character supplied in al
+charrm: 
 	mov bx, 7
 	mov ah, 0xE
 	int 10h
 	ret
-
-; .bestmode:	;preference is width > height > color
-	; mov bx, [VBEModeInfo.xresolution]
-	; cmp bx, [.width]
-	; ja .switchmode
-	; jb .searchmodes
-	; mov bx, [VBEModeInfo.yresolution]
-	; cmp bx, [.height]
-	; ja .switchmode
-	; jb .searchmodes
-	; mov bl, [VBEModeInfo.bitsperpixel]
-	; cmp bl, [.color]
-	; jb .searchmodes
-; .switchmode:
-	; mov cx, [.currentmode]
-	; mov [.mode], cx
-	; mov bx, [VBEModeInfo.xresolution]
-	; mov [.width], bx
-	; mov bx, [VBEModeInfo.yresolution]
-	; mov [.height], bx
-	; mov bl, [VBEModeInfo.bitsperpixel]
-	; mov [.color], bl
-	; jmp .searchmodes
-
-; .mode dw 0
-; .color db 0
-; .height dw 0
-; .width dw 0
