@@ -1,7 +1,8 @@
 SECTION .text
 [BITS 16]
 initialize:
-.fpu: ;enable fpu
+.fpu: 
+	; enable fpu
 	mov eax, cr4
 	or eax, 0x200
 	mov cr4, eax
@@ -11,7 +12,8 @@ initialize:
 	pop eax
 	ret
 
-.sse: ;enable sse
+.sse: 
+	; enable sse
 	mov eax, cr0
 	and al, 11111011b
 	or al, 00000010b
@@ -39,12 +41,12 @@ initialize:
 ;60853		19.60760630809765610021			51000616.00007822223218031738
 
 .pit:
-	;initialize the PIT
-	mov ax, 2685 ;this is the divider for the PIT
+	; initialize the PIT
+	mov ax, 2685 ; this is the divider for the PIT
 	out 0x40, al
 	rol ax, 8
 	out 0x40, al
-	;enable rtc interrupt
+	; enable rtc interrupt
 	mov al, 0xB
 	out 0x70, al
 	rol ax, 8
@@ -56,7 +58,8 @@ initialize:
 	out 0x71, al
 	ret
 
-.pic:	;sets up IRQs at int 20-2F
+.pic:	
+	; sets up IRQs at int 20-2F
 	mov al, 0x11
 	out 0x20, al
 	out 0xA0, al

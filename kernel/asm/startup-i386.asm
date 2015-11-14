@@ -1,20 +1,28 @@
 startup:
-  ; a20
+  ; Enable A20 line, which allows usage of memory above 1MB mark
   in al, 0x92
   or al, 2
   out 0x92, al
 
+  ; generate memory map info at address 0x0500
   call memory_map
 
+  ; initialize VESA graphics
   call vesa
 
+  ; set up: 
+  ; - FPU (Floating-Point Unit)
+  ; - SSE (Streaming SIMD Extensions)
+  ; - PIT (Programmable Interval Timer)
+  ; - PIC (Programmable Interrupt Controller)
   call initialize.fpu
   call initialize.sse
   call initialize.pit
   call initialize.pic
 
-  ; load protected mode GDT and IDT
   cli
+  
+  ; load protected mode GDT and IDT
   lgdt [gdtr]
   lidt [idtr]
   ; set protected mode bit of cr0
@@ -42,15 +50,22 @@ protected_mode:
 
     mov esp, 0x200000 - 128
 
+    ; load task register
     mov eax, gdt.tss
     ltr ax
 
-    ;rust init
+    ; rust init
+    ; load the kernel entry point as interrupt handling procedure
     mov eax, [kernel_file + 0x18]
     mov [interrupts.handler], eax
+
+    ; load parameters into eax and ebx
     mov eax, kernel_file.font
     mov ebx, tss
+    ; trigger interrupt 255, which will execute the kernel initialization function
     int 255
+
+; if something went wrong, halt the CPU / loop
 .lp:
     sti
     hlt
@@ -58,7 +73,7 @@ protected_mode:
 
 gdtr:
     dw gdt.end + 1  ; size
-    dd gdt                  ; offset
+    dd gdt          ; offset
 
 gdt:
 .null equ $ - gdt
@@ -68,7 +83,7 @@ gdt:
     dw 0xffff       ; limit 0:15
     dw 0x0000       ; base 0:15
     db 0x00         ; base 16:23
-    db 0b10011010   ; access byte - code
+    db 0b10011010   ; access byte - code ring 0
     db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
     db 0x00         ; base 24:31
 
@@ -76,7 +91,7 @@ gdt:
     dw 0xffff       ; limit 0:15
     dw 0x0000       ; base 0:15
     db 0x00         ; base 16:23
-    db 0b10010010   ; access byte - data
+    db 0b10010010   ; access byte - data ring 0
     db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
     db 0x00         ; base 24:31
 
@@ -84,7 +99,7 @@ gdt:
     dw 0xffff       ; limit 0:15
     dw 0x0000       ; base 0:15
     db 0x00         ; base 16:23
-    db 0b11111010   ; access byte - code
+    db 0b11111010   ; access byte - code ring 3
     db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
     db 0x00         ; base 24:31
 
@@ -92,7 +107,7 @@ gdt:
     dw 0xffff       ; limit 0:15
     dw 0x0000       ; base 0:15
     db 0x00         ; base 16:23
-    db 0b11110010   ; access byte - data
+    db 0b11110010   ; access byte - data ring 3
     db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
     db 0x00         ; base 24:31
 
