@@ -295,26 +295,27 @@ vesa:
 ; print number as decimal
 ; cx - number to print
 decshowrm:
-	mov ax, cx
 	push cx
-	mov cl, 10	; we will be dividing by that
+	push dx
+	mov ax, cx	; the number is in ax
+	mov cx, 10	; we will be dividing by that
 	push word 0	; this will mark that we should stop popping
 .lp:
-	div cl	; now al = ax/10, ah = ax % 10
-	add ah, '0'	; convert ah to a digit
-	push ax		; and push it on the stack
-	xor ah, ah	; now ax = al = previous ax / 10
+	xor dx, dx	; zero dx for 16-bit division
+	div cx		; now ax = ax/10, dx = ax % 10
+	add dl, '0'	; convert dl to a digit
+	push dx		; and save it on the stack
 	cmp ax, 0	; if we reached 0, we can start printing
 	je .print
 	jmp .lp		; if not, calculate next digit
 .print:
 	pop ax		; pop previously saved digit
-	xchg al, ah	; now the digit is in al
 	test al, al	; check if 0
 	jz .return	; if yes, we finished printing
 	call charrm ; print character
 	jmp .print  ; and loop
 .return:
+	pop dx
 	pop cx
 	ret
 
