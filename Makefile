@@ -237,7 +237,7 @@ virtualbox: $(BUILD)/harddrive.bin
 	echo "Delete VM"
 	-$(VBM) unregistervm Redox --delete; $(VBM_CLEANUP)
 	echo "Delete Disk"
-	-$(RM) harddrive.vdi
+	-$(RM) $(BUILD)/harddrive.vdi
 	echo "Create VM"
 	$(VBM) createvm --name Redox --register
 	echo "Set Configuration"

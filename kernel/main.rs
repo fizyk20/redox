@@ -329,6 +329,8 @@ unsafe fn init(font_data: usize, tss_data: usize) {
     session.items.push(box IpScheme { arp: Vec::new() });
     // session.items.push(box DisplayScheme);
 
+    debugln!("Spawning loops...");
+
     Context::spawn("kpoll".to_string(),
                    box move || {
                        poll_loop();
@@ -349,12 +351,16 @@ unsafe fn init(font_data: usize, tss_data: usize) {
 
     context_enabled = true;
 
+    debugln!("Starting schemes...");
+
     //TODO: Run schemes in contexts
     if let Some(mut resource) = Url::from_str("file:/schemes/").open() {
         let mut vec: Vec<u8> = Vec::new();
         resource.read_to_end(&mut vec);
 
         for folder in String::from_utf8_unchecked(vec).lines() {
+            debug::d(&folder);
+            debug!(": ");
             if folder.ends_with('/') {
                 let scheme_item = SchemeItem::from_url(&Url::from_string("file:/schemes/"
                                                                              .to_string() +
@@ -364,6 +370,7 @@ unsafe fn init(font_data: usize, tss_data: usize) {
                 session.items.push(scheme_item);
                 scheduler::end_no_ints(reenable);
             }
+            debug!("\n");
         }
     }
 
