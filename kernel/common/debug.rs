@@ -19,40 +19,45 @@ macro_rules! debugln {
     });
 }
 
+/// Emit a debug string via a syscall
 pub fn d(msg: &str) {
     unsafe {
         do_sys_debug(msg.as_ptr(), msg.len());
     }
 }
 
+/// Emit a byte as a character to debug output
 pub fn db(byte: u8) {
     unsafe {
         do_sys_debug(&byte, 1);
     }
 }
 
+/// Convert a nibble (4 bits) to hex (0-9, A-F)
+fn nibble_to_hex(nibble: u8) -> Option<u8> {
+    if nibble > 16 {
+        None
+    }
+    else if nibble <= 9 {
+        Some(nibble + ('0' as u8))
+    } 
+    else {
+        Some(nibble - 10 + ('A' as u8))
+    }
+}
+
+/// Emit a byte as hex to debug output
 pub fn dbh(byte: u8) {
-    let high = {
-        let temp: u8 = byte / 16;
-        if temp <= 9 {
-            temp + ('0' as u8)
-        } else {
-            temp - 10 + ('A' as u8)
-        }
-    };
+    // First handle the high 4 bits
+    let high = nibble_to_hex(byte / 16).unwrap();
     db(high);
 
-    let low = {
-        let temp = byte % 16;
-        if temp <= 9 {
-            temp + ('0' as u8)
-        } else {
-            temp - 10 + ('A' as u8)
-        }
-    };
+    // then the low 4 bits
+    let low = nibble_to_hex(byte % 16).unwrap();
     db(low);
 }
 
+/// Emit an usize as hex to debug output
 pub fn dh(num: usize) {
     if num >= 256 {
         dh(num / 256);
@@ -60,6 +65,7 @@ pub fn dh(num: usize) {
     dbh((num % 256) as u8);
 }
 
+/// Emit an usize as decimal to debug output
 pub fn dd(num: usize) {
     if num >= 10 {
         dd(num / 10);
@@ -67,6 +73,7 @@ pub fn dd(num: usize) {
     db('0' as u8 + (num % 10) as u8);
 }
 
+/// Emit an isize as decimal to debug output
 pub fn ds(num: isize) {
     if num >= 0 {
         dd(num as usize);
@@ -76,10 +83,12 @@ pub fn ds(num: isize) {
     }
 }
 
+/// Emit a character to debug output
 pub fn dc(character: char) {
     db(character as u8);
 }
 
+/// Emit a newline to debug output
 pub fn dl() {
     dc('\n');
 }

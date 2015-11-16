@@ -254,19 +254,21 @@ unsafe fn event_loop() -> ! {
     }
 }
 
-/// Initialize debug
+/// Initialize the serial port for debugging purposes
 pub unsafe fn debug_init() {
-    Pio8::new(0x3F8 + 1).write(0x00);
-    Pio8::new(0x3F8 + 3).write(0x80);
-    Pio8::new(0x3F8 + 0).write(0x03);
-    Pio8::new(0x3F8 + 1).write(0x00);
-    Pio8::new(0x3F8 + 3).write(0x03);
-    Pio8::new(0x3F8 + 2).write(0xC7);
-    Pio8::new(0x3F8 + 4).write(0x0B);
-    Pio8::new(0x3F8 + 1).write(0x01);
+    Pio8::new(0x3F8 + 1).write(0x00);   // disable interrupts
+    Pio8::new(0x3F8 + 3).write(0x80);   // line control: select the Baud rate divisor latch
+    Pio8::new(0x3F8 + 0).write(0x03);   // first part of the Baud rate
+    Pio8::new(0x3F8 + 1).write(0x00);   // second part of the Baud rate -> 38.4 kbps
+    Pio8::new(0x3F8 + 3).write(0x03);   // line control: select 8-bit word length
+    Pio8::new(0x3F8 + 2).write(0xC7);   // clear RCVR and XMIT FIFO queues, trigger level 14 bytes
+    Pio8::new(0x3F8 + 4).write(0x0B);   // mark port as ready to accept data
+    Pio8::new(0x3F8 + 1).write(0x01);   // enable Data Available Interrupt
 }
 
 /// Initialize kernel
+/// This function is run as the first thing after booting
+/// the addresses of the font data and the TSS struct are passed as arguments
 unsafe fn init(font_data: usize, tss_data: usize) {
     display::fonts = font_data;
     tss_ptr = tss_data as *mut TSS;

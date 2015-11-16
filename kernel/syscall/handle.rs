@@ -53,22 +53,26 @@ pub unsafe fn do_sys_debug(ptr: *const u8, len: usize) {
 
     let reenable = scheduler::start_no_ints();
 
+    // if console is available, write the message to it
     if ::console as usize > 0 {
         (*::console).write(bytes);
     }
 
-    let serial_status = Pio8::new(0x3F8 + 5);
-    let mut serial_data = Pio8::new(0x3F8);
+    // create objects for serial communication
+    let serial_status = Pio8::new(0x3F8 + 5);   // serial status port
+    let mut serial_data = Pio8::new(0x3F8);     // serial data port
+    let wait_ready = || while serial_status.read() & 0x20 == 0 {};
 
     for byte in bytes.iter() {
-        while serial_status.read() & 0x20 == 0 {}
+        wait_ready();
         serial_data.write(*byte);
 
         if *byte == 8 {
-            while serial_status.read() & 0x20 == 0 {}
+            // if backspace, write space and backspace again
+            wait_ready();
             serial_data.write(0x20);
 
-            while serial_status.read() & 0x20 == 0 {}
+            wait_ready();
             serial_data.write(8);
         }
     }
