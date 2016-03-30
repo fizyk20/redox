@@ -1,7 +1,6 @@
-use scheduler::*;
 use common::time::Duration;
 
-use drivers::pio::*;
+use drivers::io::{Io, Pio};
 
 fn cvt_bcd(value: usize) -> usize {
     (value & 0xF) + ((value / 16) * 10)
@@ -9,16 +8,16 @@ fn cvt_bcd(value: usize) -> usize {
 
 /// RTC
 pub struct Rtc {
-    addr: Pio8,
-    data: Pio8,
+    addr: Pio<u8>,
+    data: Pio<u8>,
 }
 
 impl Rtc {
     /// Create new empty RTC
     pub fn new() -> Self {
         return Rtc {
-            addr: Pio8::new(0x70),
-            data: Pio8::new(0x71),
+            addr: Pio::<u8>::new(0x70),
+            data: Pio::<u8>::new(0x71),
         };
     }
 
@@ -44,7 +43,6 @@ impl Rtc {
         let mut year;
         let register_b;
         unsafe {
-            let reenable = start_no_ints();
             self.wait();
             second = self.read(0) as usize;
             minute = self.read(2) as usize;
@@ -53,7 +51,6 @@ impl Rtc {
             month = self.read(8) as usize;
             year = self.read(9) as usize;
             register_b = self.read(0xB);
-            end_no_ints(reenable);
         }
 
         if register_b & 4 != 4 {

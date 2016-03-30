@@ -1,8 +1,6 @@
 use core::cmp::Ordering;
 use core::ops::{Add, Sub};
 
-use scheduler;
-
 pub const NANOS_PER_MICRO: i32 = 1000;
 pub const NANOS_PER_MILLI: i32 = 1000000;
 pub const NANOS_PER_SEC: i32 = 1000000000;
@@ -37,40 +35,12 @@ impl Duration {
 
     /// Get the current duration
     pub fn monotonic() -> Self {
-        let ret;
-        unsafe {
-            let reenable = scheduler::start_no_ints();
-            ret = ::clock_monotonic;
-            scheduler::end_no_ints(reenable);
-        }
-        ret
+        ::env().clock_monotonic.lock().clone()
     }
 
     /// Get the realtime
     pub fn realtime() -> Self {
-        let ret;
-        unsafe {
-            let reenable = scheduler::start_no_ints();
-            ret = ::clock_realtime;
-            scheduler::end_no_ints(reenable);
-        }
-        ret
-    }
-
-    /// Sleep the duration
-    pub fn sleep(&self) {
-        let start_time = Duration::monotonic();
-        loop {
-            let elapsed = Duration::monotonic() - start_time;
-            if elapsed > *self {
-                break;
-            } else {
-                unsafe {
-                    let disable = scheduler::start_ints();
-                    scheduler::end_ints(disable);
-                }
-            }
-        }
+        ::env().clock_realtime.lock().clone()
     }
 }
 

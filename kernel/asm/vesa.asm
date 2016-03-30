@@ -1,6 +1,6 @@
 %include "asm/vesa.inc"
-[section .text]
-[BITS 16]
+SECTION .text
+USE16
 vesa:
 .getcardinfo:
 	; Get SuperVGA information
@@ -24,10 +24,12 @@ vesa:
 	jne near .findmode
 	; Read Extended Display Identification Data (EDID)
 	; ax = 4F15
-	; bl = 1
+	; bx = 1
 	; es:di = EDID buffer
 	mov ax, 0x4F15
-	mov bl, 1
+	mov bx, 1
+	xor cx, cx
+	xor dx, dx
 	mov di, VBEEDID
 	int 0x10	; call function
 
@@ -49,7 +51,7 @@ vesa:
 	call decshowrm
 
 	; print 'x'
-	mov al, 'x'	
+	mov al, 'x'
 	call charrm
 
 	pop ecx
@@ -90,11 +92,11 @@ vesa:
 	cmp al, VBEEDID.aspect.16.10
 	jne .not1610
 
-	; it's 16:10, multiply by 5 and divide by 8 (= shr 3)
-	mov ax, 5
+	; it's 16:10, multiply by 10 and divide by 16 (= shr 4)
+	mov ax, 10
 	mul cx
 	mov cx, ax
-	shr cx, 3
+	shr cx, 4
 	jmp .gotres
 
 .not1610:
@@ -182,7 +184,6 @@ vesa:
 	; if color depth below 32 bits, we continue searching
 	cmp byte [VBEModeInfo.bitsperpixel], 32
 	jb .searchmodes
-
 .testx:
 	mov cx, [VBEModeInfo.xresolution]
 	; if we require some x resolution, check it, else continue
@@ -194,12 +195,9 @@ vesa:
 	je .testy
 	; if not, continue searching
 	jmp .searchmodes
-
 .notrequiredx:
-	; if below minimum, continue searching
 	cmp cx, [.minx]
 	jb .searchmodes
-
 .testy:
 	mov cx, [VBEModeInfo.yresolution]
 	; if we require some y resolution, check it, else continue
@@ -228,6 +226,9 @@ vesa:
 
 	; print mode info
 	push esi
+	call decshowrm
+	mov al, ':'
+	call charrm
 	mov cx, [VBEModeInfo.xresolution]	; horizontal res
 	call decshowrm
 	mov al, 'x'
@@ -276,15 +277,15 @@ vesa:
 	xor eax, eax
 	ret
 
-.minx dw 1024
-.miny dw 768
+.minx dw 640
+.miny dw 480
 .required:
-.requiredx dw 0	;USE THESE WITH CAUTION
-.requiredy dw 0
+.requiredx dw 0 ; 1024    ;USE THESE WITH CAUTION
+.requiredy dw 0 ; 768
 .requiredmode dw 0
 
 .noedidmsg db "EDID not supported.",10,13,0
-.edidmsg	db " is supported.",10,13,0
+.edidmsg    db " is supported.",10,13,0
 .modeok db 10,13,"Is this OK?(y/n)",10,13,0
 
 .goodmode dw 0
@@ -338,3 +339,31 @@ charrm:
 	mov ah, 0xE
 	int 10h
 	ret
+
+; .bestmode:	;preference is width > height > color
+	; mov bx, [VBEModeInfo.xresolution]
+	; cmp bx, [.width]
+	; ja .switchmode
+	; jb .searchmodes
+	; mov bx, [VBEModeInfo.yresolution]
+	; cmp bx, [.height]
+	; ja .switchmode
+	; jb .searchmodes
+	; mov bl, [VBEModeInfo.bitsperpixel]
+	; cmp bl, [.color]
+	; jb .searchmodes
+; .switchmode:
+	; mov cx, [.currentmode]
+	; mov [.mode], cx
+	; mov bx, [VBEModeInfo.xresolution]
+	; mov [.width], bx
+	; mov bx, [VBEModeInfo.yresolution]
+	; mov [.height], bx
+	; mov bl, [VBEModeInfo.bitsperpixel]
+	; mov [.color], bl
+	; jmp .searchmodes
+
+; .mode dw 0
+; .color db 0
+; .height dw 0
+; .width dw 0

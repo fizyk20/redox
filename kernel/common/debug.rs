@@ -1,6 +1,6 @@
 use core::str::StrExt;
 
-use syscall::handle::do_sys_debug;
+use syscall::do_sys_debug;
 
 /// Debug to console
 #[macro_export]
@@ -13,24 +13,18 @@ macro_rules! debug {
 /// Debug new line to console
 #[macro_export]
 macro_rules! debugln {
-    ($($arg:tt)*) => ({
-        debug!($($arg)*);
-        $crate::common::debug::dl();
-    });
+    ($fmt:expr) => (debug!(concat!($fmt, "\n")));
+    ($fmt:expr, $($arg:tt)*) => (debug!(concat!($fmt, "\n"), $($arg)*));
 }
 
 /// Emit a debug string via a syscall
 pub fn d(msg: &str) {
-    unsafe {
-        do_sys_debug(msg.as_ptr(), msg.len());
-    }
+    let _ = do_sys_debug(msg.as_ptr(), msg.len());
 }
 
 /// Emit a byte as a character to debug output
 pub fn db(byte: u8) {
-    unsafe {
-        do_sys_debug(&byte, 1);
-    }
+    let _ = do_sys_debug(&byte, 1);
 }
 
 /// Convert a nibble (4 bits) to hex (0-9, A-F)

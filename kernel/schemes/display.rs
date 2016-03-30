@@ -1,77 +1,136 @@
 use alloc::boxed::Box;
 
-use collections::string::ToString;
+use collections::String;
 
-use core::cmp;
+use common::event::Event;
 
-use graphics::display::Display;
+use core::{cmp, ptr};
+use core::mem::size_of;
 
-use schemes::{KScheme, Resource, ResourceSeek, Url};
+use fs::{KScheme, Resource, ResourceSeek, Url};
 
-pub struct DisplayScheme;
+use system::error::{Error, Result, EACCES, EBADF, ENOENT, EINVAL};
+use system::graphics::fast_copy;
 
-// Should there only be one display per session?
 /// A display resource
 pub struct DisplayResource {
-    /// The display
-    pub display: Box<Display>,
+    /// Path
+    path: String,
     /// Seek
-    pub seek: usize,
+    seek: usize,
 }
 
 impl Resource for DisplayResource {
+    fn dup(&self) -> Result<Box<Resource>> {
+        Ok(Box::new(DisplayResource {
+            path: self.path.clone(),
+            seek: self.seek
+        }))
+    }
+
     /// Return the URL for display resource
-    fn url(&self) -> Url {
-        Url::from_string("display:".to_string())
-    }
+    fn path(&self, buf: &mut [u8]) -> Result<usize> {
+        let path = self.path.as_bytes();
 
-
-    fn write(&mut self, buf: &[u8]) -> Option<usize> {
-        let display = &mut self.display;
-
-        let size = cmp::min(display.size - self.seek, buf.len());
-        unsafe {
-            Display::copy_run(buf.as_ptr() as usize, display.offscreen + self.seek, size);
+        for (b, p) in buf.iter_mut().zip(path.iter()) {
+            *b = *p;
         }
-        self.seek += size;
-        return Some(size);
+
+        Ok(cmp::min(buf.len(), path.len()))
     }
 
-    fn seek(&mut self, pos: ResourceSeek) -> Option<usize> {
-        let end = self.display.size;
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if buf.len() >= size_of::<Event>() {
+            let event = ::env().events.receive();
+            unsafe { ptr::write(buf.as_mut_ptr().offset(0isize) as *mut Event, event) };
+            let mut i = size_of::<Event>();
 
-        self.seek = match pos {
-            ResourceSeek::Start(offset) => cmp::min(end, cmp::max(0, offset)),
-            ResourceSeek::Current(offset) =>
-                cmp::min(end, cmp::max(0, self.seek as isize + offset) as usize),
-            ResourceSeek::End(offset) => cmp::min(end, cmp::max(0, end as isize + offset) as usize),
-        };
+            while i + size_of::<Event>() <= buf.len() {
+                if let Some(event) = ::env().events.inner.lock().pop_front() {
+                    unsafe { ptr::write(buf.as_mut_ptr().offset(i as isize) as *mut Event, event) };
+                    i += size_of::<Event>();
+                } else {
+                    break;
+                }
+            }
 
-        return Some(self.seek);
+            Ok(i)
+        } else {
+            Err(Error::new(EINVAL))
+        }
     }
 
-    fn sync(&mut self) -> bool {
-        self.display.flip();
-        true
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let console = ::env().console.lock();
+        if let Some(ref display) = console.display {
+            let size = cmp::max(0, cmp::min(display.size as isize - self.seek as isize, (buf.len()/4) as isize)) as usize;
+
+            if size > 0 {
+                unsafe {
+                    fast_copy(display.onscreen.offset(self.seek as isize), buf.as_ptr() as *const u32, size);
+                }
+            }
+
+            Ok(size)
+        } else {
+            Err(Error::new(EBADF))
+        }
+    }
+
+    fn seek(&mut self, pos: ResourceSeek) -> Result<usize> {
+        let console = ::env().console.lock();
+        if let Some(ref display) = console.display {
+            self.seek = match pos {
+                ResourceSeek::Start(offset) => cmp::min(display.size, cmp::max(0, offset)),
+                ResourceSeek::Current(offset) => cmp::min(display.size, cmp::max(0, self.seek as isize + offset) as usize),
+                ResourceSeek::End(offset) => cmp::min(display.size, cmp::max(0, display.size as isize + offset) as usize),
+            };
+
+            Ok(self.seek)
+        } else {
+            Err(Error::new(EBADF))
+        }
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        Ok(())
     }
 }
+
+pub struct DisplayScheme;
 
 impl KScheme for DisplayScheme {
     fn scheme(&self) -> &str {
         "display"
     }
 
-    fn open(&mut self, _: &Url, _: usize) -> Option<Box<Resource>> {
-        // TODO: ponder these things:
-        // - should display: be the only only valid url
-        //      for this scheme?
-        // - maybe "read" should support displays at some other location
-        //      like built in screen sharing capability or something
-        unsafe {
-            return Some(box DisplayResource {
-                display: Display::root(),
-                seek: 0,
-            });
+    fn open(&mut self, url: Url, _: usize) -> Result<Box<Resource>> {
+        if url.reference() == "manager" {
+            let mut console = ::env().console.lock();
+            if console.draw {
+                console.draw = false;
+
+                if let Some(ref display) = console.display {
+                    Ok(box DisplayResource {
+                        path: format!("display:{}/{}", display.width, display.height),
+                        seek: 0,
+                    })
+                } else {
+                    Err(Error::new(ENOENT))
+                }
+            } else {
+                Err(Error::new(EACCES))
+            }
+        } else {
+            let console = ::env().console.lock();
+            if let Some(ref display) = console.display {
+                Ok(box DisplayResource {
+                    path: format!("display:{}/{}", display.width, display.height),
+                    seek: 0,
+                })
+            } else {
+                Err(Error::new(ENOENT))
+            }
         }
     }
 }

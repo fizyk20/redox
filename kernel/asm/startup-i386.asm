@@ -1,44 +1,20 @@
-startup:
-  ; Enable A20 line, which allows usage of memory above 1MB mark
-  in al, 0x92
-  or al, 2
-  out 0x92, al
+%include "asm/startup-common.asm"
 
-  ; generate memory map info at address 0x0500
-  call memory_map
+startup_arch:
+    ; load protected mode GDT and IDT
+    cli
+    lgdt [gdtr]
+    lidt [idtr]
+    ; set protected mode bit of cr0
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
 
-  ; initialize VESA graphics
-  call vesa
+    ; far jump to load CS with 32 bit segment
+    jmp gdt.kernel_code:protected_mode
 
-  ; set up: 
-  ; - FPU (Floating-Point Unit)
-  ; - SSE (Streaming SIMD Extensions)
-  ; - PIT (Programmable Interval Timer)
-  ; - PIC (Programmable Interrupt Controller)
-  call initialize.fpu
-  call initialize.sse
-  call initialize.pit
-  call initialize.pic
-
-  cli
-  
-  ; load protected mode GDT and IDT
-  lgdt [gdtr]
-  lidt [idtr]
-  ; set protected mode bit of cr0
-  mov eax, cr0
-  or eax, 1
-  mov cr0, eax
-
-  ; far jump to load CS with 32 bit segment
-  jmp gdt.kernel_code:protected_mode
-
-%include "asm/memory_map.asm"
-%include "asm/vesa.asm"
-%include "asm/initialize.asm"
-
+USE32
 protected_mode:
-    use32
 
     ; load all the other segments with 32 bit data segments
     mov eax, gdt.kernel_data
@@ -56,13 +32,9 @@ protected_mode:
 
     ; rust init
     ; load the kernel entry point as interrupt handling procedure
-    mov eax, [kernel_file + 0x18]
+    mov eax, [kernel_base + 0x18]
     mov [interrupts.handler], eax
-
-    ; load parameters into eax and ebx
-    mov eax, kernel_file.font
-    mov ebx, tss
-    ; trigger interrupt 255, which will execute the kernel initialization function
+    mov eax, tss
     int 255
 
 ; if something went wrong, halt the CPU / loop
@@ -80,52 +52,61 @@ gdt:
     dq 0
 
 .kernel_code equ $ - gdt
-    dw 0xffff       ; limit 0:15
-    dw 0x0000       ; base 0:15
-    db 0x00         ; base 16:23
-    db 0b10011010   ; access byte - code ring 0
-    db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
-    db 0x00         ; base 24:31
+    istruc GDTEntry
+        at GDTEntry.limitl, dw 0xFFFF
+        at GDTEntry.basel, dw 0
+        at GDTEntry.basem, db 0
+        at GDTEntry.attribute, db attrib.present | attrib.user | attrib.code | attrib.readable
+        at GDTEntry.flags__limith, db 0xFF | flags.granularity | flags.default_operand_size
+        at GDTEntry.baseh, db 0
+    iend
 
 .kernel_data equ $ - gdt
-    dw 0xffff       ; limit 0:15
-    dw 0x0000       ; base 0:15
-    db 0x00         ; base 16:23
-    db 0b10010010   ; access byte - data ring 0
-    db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
-    db 0x00         ; base 24:31
+    istruc GDTEntry
+        at GDTEntry.limitl, dw 0xFFFF
+        at GDTEntry.basel, dw 0
+        at GDTEntry.basem, db 0
+        at GDTEntry.attribute, db attrib.present | attrib.user | attrib.writable
+        at GDTEntry.flags__limith, db 0xFF | flags.granularity | flags.default_operand_size
+        at GDTEntry.baseh, db 0
+    iend
 
 .user_code equ $ - gdt
-    dw 0xffff       ; limit 0:15
-    dw 0x0000       ; base 0:15
-    db 0x00         ; base 16:23
-    db 0b11111010   ; access byte - code ring 3
-    db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
-    db 0x00         ; base 24:31
+    istruc GDTEntry
+        at GDTEntry.limitl, dw 0xFFFF
+        at GDTEntry.basel, dw 0
+        at GDTEntry.basem, db 0
+        at GDTEntry.attribute, db attrib.present | attrib.ring3 | attrib.user | attrib.code | attrib.readable
+        at GDTEntry.flags__limith, db 0xFF | flags.granularity | flags.default_operand_size
+        at GDTEntry.baseh, db 0
+    iend
 
 .user_data equ $ - gdt
-    dw 0xffff       ; limit 0:15
-    dw 0x0000       ; base 0:15
-    db 0x00         ; base 16:23
-    db 0b11110010   ; access byte - data ring 3
-    db 0xdf         ; flags/(limit 16:19). flag is set to 32 bit protected mode
-    db 0x00         ; base 24:31
+    istruc GDTEntry
+        at GDTEntry.limitl, dw 0xFFFF
+        at GDTEntry.basel, dw 0
+        at GDTEntry.basem, db 0
+        at GDTEntry.attribute, db attrib.present | attrib.ring3 | attrib.user | attrib.writable
+        at GDTEntry.flags__limith, db 0xFF | flags.granularity | flags.default_operand_size
+        at GDTEntry.baseh, db 0
+    iend
 
 .tss equ $ - gdt
-    dw (tss.end-tss) & 0xFFFF         ; limit 0:15
-    dw (tss-$$+0x7C00) & 0xFFFF             ; base 0:15
-    db ((tss-$$+0x7C00) >> 16) & 0xFF       ; base 16:23
-    db 0b11101001                           ; access byte - data
-    db 0x40 | ((tss.end-tss) >> 16) & 0xF    ; flags/(limit 16:19). flag is set to 32 bit protected mode
-    db ((tss-$$+0x7C00) >> 24) & 0xFF       ; base 24:31
-
+    istruc GDTEntry
+        at GDTEntry.limitl, dw (tss.end - tss) & 0xFFFF
+        at GDTEntry.basel, dw (tss-$$+0x7C00) & 0xFFFF
+        at GDTEntry.basem, db ((tss-$$+0x7C00) >> 16) & 0xFF
+        at GDTEntry.attribute, db attrib.present | attrib.ring3 | attrib.tssAvailabe32
+        at GDTEntry.flags__limith, db ((tss.end - tss) >> 16) & 0xF
+        at GDTEntry.baseh, db ((tss-$$+0x7C00) >> 24) & 0xFF
+    iend
 .end equ $ - gdt
 
 struc TSS
     .prev_tss resd 1    ;The previous TSS - if we used hardware task switching this would form a linked list.
     .esp0 resd 1        ;The stack pointer to load when we change to kernel mode.
     .ss0 resd 1         ;The stack segment to load when we change to kernel mode.
-    .esp1 resd 1        ;everything below here is unusued now..
+    .esp1 resd 1        ;everything below here is unused now..
     .ss1 resd 1
     .esp2 resd 1
     .ss2 resd 1

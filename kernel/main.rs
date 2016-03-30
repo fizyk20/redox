@@ -1,24 +1,29 @@
+#![crate_name="kernel"]
 #![crate_type="staticlib"]
 #![feature(alloc)]
 #![feature(allocator)]
+#![feature(arc_counts)]
 #![feature(asm)]
 #![feature(box_syntax)]
 #![feature(collections)]
 #![feature(const_fn)]
 #![feature(core_intrinsics)]
-#![feature(core_simd)]
 #![feature(core_str_ext)]
 #![feature(core_slice_ext)]
 #![feature(fnbox)]
 #![feature(fundamental)]
 #![feature(lang_items)]
-#![feature(no_std)]
+#![feature(naked_functions)]
 #![feature(unboxed_closures)]
 #![feature(unsafe_no_drop_flag)]
 #![feature(unwind_attributes)]
-#![feature(vec_push_all)]
-#![feature(raw)]
+#![feature(zero_one)]
+#![feature(collections_range)]
 #![no_std]
+
+#![allow(deprecated)]
+#![deny(warnings)]
+//#![deny(missing_docs)]
 
 #[macro_use]
 extern crate alloc;
@@ -26,372 +31,375 @@ extern crate alloc;
 #[macro_use]
 extern crate collections;
 
+extern crate system;
+
+use acpi::Acpi;
+
 use alloc::boxed::Box;
 
-use collections::string::{String, ToString};
-use collections::vec::Vec;
+use arch::context::{context_switch, Context};
+use arch::memory;
+use arch::paging::Page;
+use arch::regs::Regs;
+use arch::tss::Tss;
 
-use core::mem;
+use collections::string::ToString;
+
+use core::{ptr, mem, usize};
 use core::slice::SliceExt;
 
-use common::debug;
-use common::event::{self, Event, EventOption};
-use common::get_slice::GetSlice;
-use common::memory;
-use common::paging::Page;
-use common::queue::Queue;
-// use common::prompt;
 use common::time::Duration;
 
-use drivers::pci::*;
-use drivers::pio::*;
+use drivers::pci;
+use drivers::io::{Io, Pio};
 use drivers::ps2::*;
 use drivers::rtc::*;
 use drivers::serial::*;
 
-use env::console::Console;
-
-pub use externs::*;
+use env::Environment;
 
 use graphics::display;
 
-use programs::executor::execute;
-use programs::scheme::*;
-use programs::session::*;
-
-use scheduler::{Context, Regs, TSS};
-use scheduler::context::{context_enabled, context_exit, context_switch, context_i, contexts_ptr};
-
-use schemes::Url;
-use schemes::arp::*;
 use schemes::context::*;
 use schemes::debug::*;
-use schemes::ethernet::*;
-use schemes::icmp::*;
-use schemes::ip::*;
+use schemes::display::*;
+use schemes::initfs::*;
+use schemes::interrupt::*;
 use schemes::memory::*;
-//use schemes::display::*;
+use schemes::test::*;
 
-use syscall::handle::*;
+use syscall::execute::execute;
+use syscall::{do_sys_chdir, do_sys_exit, do_sys_open, syscall_handle};
 
-/// Common std-like functionality
+pub use externs::*;
+
+/// Common std-like functionality.
+///
+/// This module implements basic primitives for kernel space. They are not exposed to userspace.
 #[macro_use]
 pub mod common;
-/// Allocation
+/// Macros used in the kernel.
+#[macro_use]
+pub mod macros;
+/// Allocation lang items.
+///
+/// This module defines __rust_allocate lang item and friends, simply wrapping the allocation
+/// method defined in `arch::memory`.
 pub mod alloc_system;
-/// Audio
+/// ACPI implementation.
+///
+/// ACPI (Advanced Configuration and Power Interface) is the open standard for hardware detection,
+/// power management, and hardware configuration. This module contains support for a subset of the
+/// ACPI standard.
+pub mod acpi;
+/// Architecture dependent objects.
+///
+/// This module contains various mechanisms and primitives, such as ELF loading, interrupt locking,
+/// memory paging, and so on.
+///
+/// This module is highly central to the kernel.
+pub mod arch;
+/// Audio drivers.
+///
+/// Drivers for controlling, playing, and configuring audio output.
+///
+/// This module contains `ac97` and `intelhda` audio drivers. These are likely to be moved to
+/// userspace in the future.
 pub mod audio;
-/// Various drivers
-/// TODO: Move out of kernel space (like other microkernels)
+/// Disk drivers.
+///
+/// Drivers for reading and writing disks. Currently includes drivers for following interfaces:
+/// AHCI (Advanced Host Controller Interface), IDE (Integrated Drive Electronics), and ATA-1 (AT
+/// Attachment Interface for Disk Drives).
+pub mod disk;
+/// Miscellaneous drivers.
+///
+/// This module contains miscellaneous drivers, including PCI (Peripheral Component
+/// Interconnect), PS/2 (for keyboards and mice), RTC (real-time clock), SATA (Serial AT
+/// Attachment), and keyboard layouts.
 pub mod drivers;
-/// Environment
+/// The kernel environment.
+///
+/// This module defines the `Environment` struct, which has the job to track the state of the
+/// kernel. This includes context management, system console, scheme registrar, and so on.
 pub mod env;
-/// Externs
+/// Functions required for the Rust runtime, like memcpy and memset
 pub mod externs;
-/// Various graphical methods
+/// File system.
+///
+/// This module manages virtual and non-virtual file systems. Furthermore, it defines URL,
+/// `Scheme`, and `Resource`.
+pub mod fs;
+/// Graphic management.
+///
+/// This module contains the initial display manager and various graphics primitives.
 pub mod graphics;
-/// Network
+/// Networking.
+///
+/// This module contains drivers (e.g, intel8254x and rtl8139), primitives, schemes, and data
+/// structures related to networking, providing Redox's networking stack.
 pub mod network;
-/// Panic
+/// Kernel panic handling.
+///
+/// This module defines the kernel panic mechanism, which will halt the kernel (i.e. `sti; hlt;`)
+/// in case of panics.
 pub mod panic;
-/// Programs
-pub mod programs;
-/// Schemes
+/// Schemes.
+///
+/// This module contains various schemes, such as `display:`, `debug:`, `memory:` and so on.
 pub mod schemes;
-/// Scheduling
-pub mod scheduler;
-/// System calls
+/// Synchronization primitives.
+///
+/// This module provides various primitives for performing synchronization to avoid data races,
+/// interrupts, and other unsafe conditions, when performing concurrent computation.
+pub mod sync;
+/// System calls and system call handler.
+///
+/// This module defines the system call handler and system calls of Redox.
+///
+/// System calls are the only way an userspace application can communicate with the kernel space.
+/// Redox do, by design, have a very small number of syscalls when compared to Linux.
+///
+/// The system call interface is very similar to POSIX's system calls, making Redox able to run
+/// many Unix programs.
 pub mod syscall;
-/// USB input/output
+/// Drivers and primitives for USB input/output.
+///
+/// USB (Universal Serial Bus) is a standardized serial bus interface, used for many peripherals.
+/// This modules contains drivers and other tools for USB.
 pub mod usb;
 
-pub static mut tss_ptr: *mut TSS = 0 as *mut TSS;
+/// The TTS pointer.
+///
+/// This static contains a mutable pointer to the TSS (task state segment), which is a data
+/// structure used on x86-based architectures for holding information about a specific task. See
+/// `Tss` for more information.
+pub static mut TSS_PTR: Option<&'static mut Tss> = None;
+/// The environment pointer.
+///
+/// The pointer to the kernel environment, holding the state of the kernel.
+pub static mut ENV_PTR: Option<&'static mut Environment> = None;
 
-/// Default console for debugging
-static mut console: *mut Console = 0 as *mut Console;
+/// Get the environment pointer.
+///
+/// This is unsafe, due to reading of a mutable static variable.
+pub fn env() -> &'static Environment {
+    unsafe {
+        match ENV_PTR {
+            Some(&mut ref p) => p,
+            None => unreachable!(),
+        }
+    }
+}
 
-/// Clock realtime (default)
-static mut clock_realtime: Duration = Duration {
-    secs: 0,
-    nanos: 0,
-};
-
-/// Monotonic clock
-static mut clock_monotonic: Duration = Duration {
-    secs: 0,
-    nanos: 0,
-};
-
-/// Pit duration
+/// The PIT (programmable interval timer) duration.
+///
+/// This duration defines the PIT interval, which is added to the monotonic clock and the real time
+/// clock, when interrupt 0x20 is received.
 static PIT_DURATION: Duration = Duration {
     secs: 0,
     nanos: 2250286,
 };
 
-/// Session pointer
-static mut session_ptr: *mut Session = 0 as *mut Session;
-
-/// Event pointer
-static mut events_ptr: *mut Queue<Event> = 0 as *mut Queue<Event>;
-
-/// Idle loop (active while idle)
-unsafe fn idle_loop() -> ! {
+/// The idle loop.
+///
+/// This loop runs while the system is idle.
+fn idle_loop() {
     loop {
-        asm!("cli" : : : : "intel", "volatile");
+        unsafe { asm!("cli" : : : : "intel", "volatile"); }
 
         let mut halt = true;
 
-        let contexts = &*contexts_ptr;
-        for i in 1..contexts.len() {
-            match contexts.get(i) {
-                Some(context) => if context.interrupted {
-                    halt = false;
-                    break;
-                },
-                None => (),
+        for context in env().contexts.lock().iter().skip(1) {
+            if !context.blocked {
+                halt = false;
+                break;
             }
         }
 
         if halt {
-            asm!("sti" : : : : "intel", "volatile");
-            asm!("hlt" : : : : "intel", "volatile");
+            unsafe { asm!("sti ; hlt" : : : : "intel", "volatile"); }
         } else {
-            asm!("sti" : : : : "intel", "volatile");
+            unsafe { asm!("sti ; nop" : : : : "intel", "volatile"); }
+            unsafe { context_switch(); }
         }
-
-        context_switch(false);
     }
 }
 
-/// Event poll loop
-unsafe fn poll_loop() -> ! {
-    let session = &mut *session_ptr;
+extern {
+    /// The starting byte of the text (code) data segment.
+    static mut __text_start: u8;
+    /// The ending byte of the text (code) data segment.
+    static mut __text_end: u8;
+    /// The starting byte of the _.rodata_ (read-only data) segment.
+    static mut __rodata_start: u8;
+    /// The ending byte of the _.rodata_ (read-only data) segment.
+    static mut __rodata_end: u8;
+    /// The starting byte of the _.data_ segment.
+    static mut __data_start: u8;
+    /// The ending byte of the _.data_ segment.
+    static mut __data_end: u8;
+    /// The starting byte of the _.bss_ (uninitialized data) segment.
+    static mut __bss_start: u8;
+    /// The ending byte of the _.bss_ (uninitialized data) segment.
+    static mut __bss_end: u8;
+}
 
-    loop {
-        session.on_poll();
+/// Test of zero values in BSS.
+static BSS_TEST_ZERO: usize = 0;
+/// Test of non-zero values in BSS.
+static BSS_TEST_NONZERO: usize = !0;
 
-        context_switch(false);
+/// Initialize the kernel.
+///
+/// This will initialize the kernel: the environment, the memory allocator, the memory pager, PCI and so
+/// on.
+///
+/// Note that this will not start the even loop.
+unsafe fn init(tss_data: usize) {
+
+    // Test
+    assume!(true);
+
+    // Zero BSS, this initializes statics that are set to 0
+    {
+        let start_ptr = &mut __bss_start as *mut u8;
+        let end_ptr = & __bss_end as *const u8 as usize;
+
+        if start_ptr as usize <= end_ptr {
+            let size = end_ptr - start_ptr as usize;
+            memset(start_ptr, 0, size);
+        }
+
+        debug_assert_eq!(BSS_TEST_ZERO, 0);
+        debug_assert_eq!(BSS_TEST_NONZERO, usize::MAX);
     }
 }
 
-/// Event loop
-unsafe fn event_loop() -> ! {
-    let events = &mut *events_ptr;
-    let mut cmd = String::new();
-    loop {
-        loop {
-            let reenable = scheduler::start_no_ints();
-
-            let event_option = events.pop();
-
-            scheduler::end_no_ints(reenable);
-
-            match event_option {
-                Some(event) => {
-                    if (*console).draw {
-                        match event.to_option() {
-                            EventOption::Key(key_event) => {
-                                if key_event.pressed {
-                                    match key_event.scancode {
-                                        event::K_F2 => {
-                                            (*console).draw = false;
-                                        }
-                                        event::K_BKSP => if !cmd.is_empty() {
-                                            debug::db(8);
-                                            cmd.pop();
-                                        },
-                                        _ => match key_event.character {
-                                            '\0' => (),
-                                            '\n' => {
-                                                let reenable = scheduler::start_no_ints();
-                                                (*console).command = Some(cmd.clone());
-                                                scheduler::end_no_ints(reenable);
-
-                                                cmd.clear();
-                                                debug::dl();
-                                            }
-                                            _ => {
-                                                cmd.push(key_event.character);
-                                                debug::dc(key_event.character);
-                                            }
-                                        },
-                                    }
-                                }
-                            }
-                            _ => (),
-                        }
-                    } else {
-                        if event.code == 'k' && event.b as u8 == event::K_F1 && event.c > 0 {
-                            (*console).draw = true;
-                            (*console).redraw = true;
-                        } else {
-                            // TODO: Magical orbital hack
-                            let reenable = scheduler::start_no_ints();
-                            for item in (*::session_ptr).items.iter_mut() {
-                                if item.scheme() == "orbital" {
-                                    item.event(&event);
-                                    break;
-                                }
-                            }
-                            scheduler::end_no_ints(reenable);
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
-
-        if (*console).draw {
-            if (*console).redraw {
-                (*console).redraw = false;
-                (*console).display.flip();
-            }
-        } else {
-            // session.redraw();
-        }
-
-        context_switch(false);
-    }
-}
-
-/// Initialize the serial port for debugging purposes
-pub unsafe fn debug_init() {
-    Pio8::new(0x3F8 + 1).write(0x00);   // disable interrupts
-    Pio8::new(0x3F8 + 3).write(0x80);   // line control: select the Baud rate divisor latch
-    Pio8::new(0x3F8 + 0).write(0x03);   // first part of the Baud rate
-    Pio8::new(0x3F8 + 1).write(0x00);   // second part of the Baud rate -> 38.4 kbps
-    Pio8::new(0x3F8 + 3).write(0x03);   // line control: select 8-bit word length
-    Pio8::new(0x3F8 + 2).write(0xC7);   // clear RCVR and XMIT FIFO queues, trigger level 14 bytes
-    Pio8::new(0x3F8 + 4).write(0x0B);   // mark port as ready to accept data
-    Pio8::new(0x3F8 + 1).write(0x01);   // enable Data Available Interrupt
-}
-
-/// Initialize kernel
-/// This function is run as the first thing after booting
-/// the addresses of the font data and the TSS struct are passed as arguments
-unsafe fn init(font_data: usize, tss_data: usize) {
-    display::fonts = font_data;
-    tss_ptr = tss_data as *mut TSS;
-
-    console = 0 as *mut Console;
-
-    clock_realtime.secs = 0;
-    clock_realtime.nanos = 0;
-
-    clock_monotonic.secs = 0;
-    clock_monotonic.nanos = 0;
-
-    contexts_ptr = 0 as *mut Vec<Box<Context>>;
-    context_i = 0;
-    context_enabled = false;
-
-    session_ptr = 0 as *mut Session;
-
-    events_ptr = 0 as *mut Queue<Event>;
-
-    debug_init();
-
+    // Setup paging, this allows for memory allocation
     Page::init();
     memory::cluster_init();
-    // Unmap first page to catch null pointer errors (after reading memory map)
-    Page::new(0).unmap();
 
-    console = Box::into_raw(Console::new());
-    (*console).draw = true;
+    // Get the VBE information before unmapping the first megabyte
+    display::vbe_init();
 
-    debug!("Redox ");
-    debug::dd(mem::size_of::<usize>() * 8);
-    debug!(" bits");
-    debug::dl();
+    // Unmap first page (TODO: Unmap more)
+    {
+        let start_ptr = 0;
+        let end_ptr = 0x1000;
 
-    clock_realtime = Rtc::new().time();
-
-    contexts_ptr = Box::into_raw(box Vec::new());
-    (*contexts_ptr).push(Context::root());
-
-    session_ptr = Box::into_raw(Session::new());
-
-    events_ptr = Box::into_raw(box Queue::new());
-
-    let session = &mut *session_ptr;
-
-    session.items.push(Ps2::new());
-    session.items.push(Serial::new(0x3F8, 0x4));
-
-    pci_init(session);
-
-    session.items.push(DebugScheme::new());
-    session.items.push(box ContextScheme);
-    session.items.push(box MemoryScheme);
-    // session.items.push(box RandomScheme);
-    // session.items.push(box TimeScheme);
-
-    session.items.push(box EthernetScheme);
-    session.items.push(box ArpScheme);
-    session.items.push(box IcmpScheme);
-    session.items.push(box IpScheme { arp: Vec::new() });
-    // session.items.push(box DisplayScheme);
-
-    Context::spawn("kpoll".to_string(),
-                   box move || {
-                       poll_loop();
-                   });
-    Context::spawn("kevent".to_string(),
-                   box move || {
-                       event_loop();
-                   });
-
-    Context::spawn("karp".to_string(),
-                   box move || {
-                       ArpScheme::reply_loop();
-                   });
-    Context::spawn("kicmp".to_string(),
-                   box move || {
-                       IcmpScheme::reply_loop();
-                   });
-
-    context_enabled = true;
-
-    //TODO: Run schemes in contexts
-    if let Some(mut resource) = Url::from_str("file:/schemes/").open() {
-        let mut vec: Vec<u8> = Vec::new();
-        resource.read_to_end(&mut vec);
-
-        for folder in String::from_utf8_unchecked(vec).lines() {
-            if folder.ends_with('/') {
-                let scheme_item = SchemeItem::from_url(&Url::from_string("file:/schemes/"
-                                                                             .to_string() +
-                                                                         &folder));
-
-                let reenable = scheduler::start_no_ints();
-                session.items.push(scheme_item);
-                scheduler::end_no_ints(reenable);
+        if start_ptr <= end_ptr {
+            let size = end_ptr - start_ptr;
+            for page in 0..(size + 4095)/4096 {
+                Page::new(start_ptr + page * 4096).unmap();
             }
         }
     }
 
+    // Remap text
     {
-        let path_string = "file:/apps/terminal/main.bin";
-        let path = Url::from_string(path_string.to_string());
-        let wd = Url::from_string(path_string.get_slice(None,
-                                                        Some(path_string.rfind('/').unwrap_or(0) +
-                                                             1))
-                                             .to_string());
-        execute(&path, &wd, Vec::new());
+        let start_ptr = & __text_start as *const u8 as usize;
+        let end_ptr = & __text_end as *const u8 as usize;
+        if start_ptr <= end_ptr {
+            let size = end_ptr - start_ptr;
+            for page in 0..(size + 4095)/4096 {
+                Page::new(start_ptr + page * 4096).
+                    map_kernel_read(start_ptr + page * 4096);
+            }
+        }
+    }
+
+    // Remap rodata
+    {
+        let start_ptr = & __rodata_start as *const u8 as usize;
+        let end_ptr = & __rodata_end as *const u8 as usize;
+        if start_ptr <= end_ptr {
+            let size = end_ptr - start_ptr;
+            for page in 0..(size + 4095)/4096 {
+                Page::new(start_ptr + page * 4096).
+                    map_kernel_read(start_ptr + page * 4096);
+            }
+        }
+    }
+
+    // Unmap logical/high mem
+    {
+        let start_ptr = 0x80000000;
+        let end_ptr = 0xE0000000;
+
+        if start_ptr <= end_ptr {
+            let size = end_ptr - start_ptr;
+            for page in 0..(size + 4095)/4096 {
+                Page::new(start_ptr + page * 4096).unmap();
+            }
+        }
+    }
+
+    TSS_PTR = Some(&mut *(tss_data as *mut Tss));
+    ENV_PTR = Some(&mut *Box::into_raw(Environment::new()));
+
+    match ENV_PTR {
+        Some(ref mut env) => {
+            env.contexts.lock().push(Context::root());
+
+            env.console.lock().draw = true;
+
+            debugln!("Redox {} bits", mem::size_of::<usize>() * 8);
+
+            if let Some(acpi) = Acpi::new() {
+                env.schemes.lock().push(acpi);
+            }
+
+            *(env.clock_realtime.lock()) = Rtc::new().time();
+
+            env.schemes.lock().push(Ps2::new());
+            env.schemes.lock().push(Serial::new(0x3F8, 0x4));
+
+            pci::pci_init(env);
+
+            env.schemes.lock().push(DebugScheme::new());
+            env.schemes.lock().push(InitFsScheme::new());
+            env.schemes.lock().push(box ContextScheme);
+            env.schemes.lock().push(box DisplayScheme);
+            env.schemes.lock().push(box InterruptScheme);
+            env.schemes.lock().push(box MemoryScheme);
+            env.schemes.lock().push(box TestScheme);
+
+            env.contexts.lock().enabled = true;
+
+            Context::spawn("kinit".to_string(),
+            box move || {
+                {
+                    let wd_c = "file:/\0";
+                    do_sys_chdir(wd_c.as_ptr()).unwrap();
+
+                    let stdio_c = "debug:\0";
+                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
+                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
+                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
+                }
+
+                if let Err(err) = execute(vec!["init".to_string()]) {
+                    debugln!("INIT: Failed to execute: {}", err);
+                }
+            });
+        },
+        None => unreachable!(),
     }
 }
 
 #[cold]
 #[inline(never)]
 #[no_mangle]
-/// Take regs for kernel calls and exceptions
-pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
+/// Interrupt and exception handling.
+pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
     macro_rules! exception_inner {
         ($name:expr) => ({
-            if let Some(context) = Context::current() {
-                debugln!("PID {}: {}", context_i, context.name);
-            } else {
-                debugln!("PID {}", context_i,);
+            {
+                let contexts = ::env().contexts.lock();
+                if let Ok(context) = contexts.current() {
+                    debugln!("PID {}: {}", context.pid, context.name);
+                }
             }
 
             debugln!("  INT {:X}: {}", interrupt, $name);
@@ -401,17 +409,33 @@ pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
             debugln!("    DI:  {:08X}    SI:  {:08X}", regs.di, regs.di);
 
             let cr0: usize;
-            asm!("mov $0, cr0" : "=r"(cr0) : : : "intel", "volatile");
-
             let cr2: usize;
-            asm!("mov $0, cr2" : "=r"(cr2) : : : "intel", "volatile");
-
             let cr3: usize;
-            asm!("mov $0, cr3" : "=r"(cr3) : : : "intel", "volatile");
-
             let cr4: usize;
-            asm!("mov $0, cr4" : "=r"(cr4) : : : "intel", "volatile");
+            unsafe {
+                asm!("mov $0, cr0" : "=r"(cr0) : : : "intel", "volatile");
+                asm!("mov $0, cr2" : "=r"(cr2) : : : "intel", "volatile");
+                asm!("mov $0, cr3" : "=r"(cr3) : : : "intel", "volatile");
+                asm!("mov $0, cr4" : "=r"(cr4) : : : "intel", "volatile");
+            }
             debugln!("    CR0: {:08X}    CR2: {:08X}    CR3: {:08X}    CR4: {:08X}", cr0, cr2, cr3, cr4);
+
+            let mut fsw: usize = 0;
+            let mut fcw: usize = 0;
+            unsafe {
+                asm!("fnstsw $0" : "=*m"(&mut fsw) : : : "intel", "volatile");
+                asm!("fnstcw $0" : "=*m"(&mut fcw) : : : "intel", "volatile");
+            }
+            debugln!("    FSW: {:08X}    FCW: {:08X}", fsw, fcw);
+
+            let sp = regs.sp as *const u32;
+            for y in -15..16 {
+                debug!("    {:>3}:", y * 8 * 4);
+                for x in 0..8 {
+                    debug!(" {:08X}", unsafe { ptr::read(sp.offset(-(x + y * 8))) });
+                }
+                debug!("\n");
+            }
         })
     };
 
@@ -420,7 +444,7 @@ pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
             exception_inner!($name);
 
             loop {
-                context_exit();
+                do_sys_exit(usize::MAX);
             }
         })
     };
@@ -439,49 +463,43 @@ pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
             debugln!("    ERR: {:08X}", error);
 
             loop {
-                context_exit();
+                do_sys_exit(usize::MAX);
             }
         })
     };
 
-    if interrupt >= 0x20 && interrupt < 0x30 {
-        if interrupt >= 0x28 {
-            Pio8::new(0xA0).write(0x20);
-        }
-
-        Pio8::new(0x20).write(0x20);
+    //Do not catch init interrupt
+    if interrupt < 0xFF {
+        env().interrupts.lock()[interrupt as usize] += 1;
     }
 
     match interrupt {
         0x20 => {
-            let reenable = scheduler::start_no_ints();
-            clock_realtime = clock_realtime + PIT_DURATION;
-            clock_monotonic = clock_monotonic + PIT_DURATION;
-            scheduler::end_no_ints(reenable);
+            {
+                let mut clock_monotonic = env().clock_monotonic.lock();
+                *clock_monotonic = *clock_monotonic + PIT_DURATION;
+            }
+            {
+                let mut clock_realtime = env().clock_realtime.lock();
+                *clock_realtime = *clock_realtime + PIT_DURATION;
+            }
 
-            context_switch(true);
+            if let Ok(mut current) = env().contexts.lock().current_mut() {
+                current.time += 1;
+            }
+
+            unsafe { context_switch(); }
         }
-        0x21 => (*session_ptr).on_irq(0x1), // keyboard
-        0x23 => (*session_ptr).on_irq(0x3), // serial 2 and 4
-        0x24 => (*session_ptr).on_irq(0x4), // serial 1 and 3
-        0x25 => (*session_ptr).on_irq(0x5), //parallel 2
-        0x26 => (*session_ptr).on_irq(0x6), //floppy
-        0x27 => (*session_ptr).on_irq(0x7), //parallel 1 or spurious
-        0x28 => (*session_ptr).on_irq(0x8), //RTC
-        0x29 => (*session_ptr).on_irq(0x9), //pci
-        0x2A => (*session_ptr).on_irq(0xA), //pci
-        0x2B => (*session_ptr).on_irq(0xB), //pci
-        0x2C => (*session_ptr).on_irq(0xC), //mouse
-        0x2D => (*session_ptr).on_irq(0xD), //coprocessor
-        0x2E => (*session_ptr).on_irq(0xE), //disk
-        0x2F => (*session_ptr).on_irq(0xF), //disk
-        0x80 => if !syscall_handle(regs) {
-            exception!("Unknown Syscall");
+        i @ 0x21 ... 0x2F => {
+            env().on_irq(i as u8 - 0x20);
         },
+        0x80 => syscall_handle(regs),
         0xFF => {
-            init(regs.ax, regs.bx);
-            idle_loop();
-        }
+            unsafe {
+                init(regs.ax);
+                idle_loop();
+            }
+        },
         0x0 => exception!("Divide by zero exception"),
         0x1 => exception!("Debug exception"),
         0x2 => exception!("Non-maskable interrupt"),
@@ -491,6 +509,7 @@ pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
         0x6 => exception!("Invalid opcode exception"),
         0x7 => exception!("Device not available exception"),
         0x8 => exception_error!("Double fault"),
+        0x9 => exception!("Coprocessor Segment Overrun"), // legacy
         0xA => exception_error!("Invalid TSS exception"),
         0xB => exception_error!("Segment not present exception"),
         0xC => exception_error!("Stack-segment fault"),
@@ -503,5 +522,13 @@ pub unsafe extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
         0x14 => exception!("Virtualization exception"),
         0x1E => exception_error!("Security exception"),
         _ => exception!("Unknown Interrupt"),
+    }
+
+    if interrupt >= 0x20 && interrupt < 0x30 {
+        if interrupt >= 0x28 {
+            Pio::<u8>::new(0xA0).write(0x20);
+        }
+
+        Pio::<u8>::new(0x20).write(0x20);
     }
 }

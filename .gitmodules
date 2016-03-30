@@ -1,0 +1,54 @@
+[submodule "crates/ion"]
+	path = crates/ion
+	url = https://github.com/redox-os/ion.git
+[submodule "filesystem/apps/sodium"]
+	path = filesystem/apps/sodium
+	url = https://github.com/redox-os/sodium.git
+[submodule "crates/orbtk"]
+	path = crates/orbtk
+	url = https://github.com/redox-os/orbtk
+[submodule "crates/coreutils"]
+	path = crates/coreutils
+	url = https://github.com/redox-os/coreutils.git
+[submodule "crates/orbclient"]
+	path = crates/orbclient
+	url = https://github.com/redox-os/orbclient
+[submodule "crates/orbutils"]
+	path = crates/orbutils
+	url = https://github.com/redox-os/orbutils.git
+[submodule "crates/redoxfs"]
+	path = crates/redoxfs
+	url = https://github.com/redox-os/redoxfs.git
+[submodule "crates/extrautils"]
+	path = crates/extrautils
+	url = https://github.com/redox-os/extrautils.git
+[submodule "crates/binutils"]
+	path = crates/binutils
+	url = https://github.com/redox-os/binutils.git
+[submodule "crates/games"]
+	path = crates/games
+	url = https://github.com/redox-os/games-for-redox.git
+[submodule "crates/termion"]
+	path = crates/termion
+	url = https://github.com/jackpot51/termion.git
+[submodule "installer"]
+	path = installer
+	url = https://github.com/redox-os/installer.git
+[submodule "crates/zfs"]
+	path = crates/zfs
+	url = https://github.com/redox-os/zfs.git
+[submodule "crates/extra"]
+	path = crates/extra
+	url = https://github.com/redox-os/libextra.git
+[submodule "crates/pixelcannon"]
+	path = crates/pixelcannon
+	url = https://github.com/pythoneer/pixelcannon.git
+[submodule "crates/malloc"]
+	path = crates/malloc
+	url = https://github.com/redox-os/libmalloc.git
+[submodule "crates/sdl3d"]
+	path = crates/sdl3d
+	url = https://github.com/ca1ek/sdl3d.git
+[submodule "crates/rusttype"]
+	path = crates/rusttype
+	url = https://github.com/jackpot51/rusttype.git

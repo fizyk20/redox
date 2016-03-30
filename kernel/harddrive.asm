@@ -14,7 +14,7 @@ fs_header:
 .padding:
     align 256, db 0
 .extents:   ; node extents
-    dq (fs_root_node_list - boot)/512   ; sectors taken by startup scripts + kernel + fonts
+    dq (fs_root_node_list - boot) / 512   ; sectors taken by startup scripts + kernel + fonts
     dq (fs_root_node_list.end - fs_root_node_list)  ; sectors taken by root node list
 
     align 512, db 0
@@ -28,32 +28,31 @@ fs_header:
 %ifdef ARCH_x86_64
     %include "asm/startup-x86_64.asm"
 %endif
+align 512, db 0
+startup_end:
 
-times (0xC000-0x1000)-0x7C00-($-$$) db 0
+;times (0xC000-0x1000)-0x7C00-($-$$) db 0
 
 ; include the kernel
 kernel_file:
   incbin "kernel.bin"
   align 512, db 0
-
-; include fonts
-.font:
-  incbin "ui/unifont.font"
-  align 512, db 0
 .end:
+.length equ kernel_file.end - kernel_file
+.length_sectors equ .length / 512
 
 ; generate root nodes
 fs_root_node_list:
 ; this macro will generate filesystem entries for the files
-%macro file 2+ 
+%macro file 2+
     fs_node.%1:
     .name:
-        db %2,0 ; file name
+        db %2,0
 
         align 256, db 0
 
     .extents:
-        dq (fs_data.%1 - boot)/512  ; first sector of the file
+        dq (fs_data.%1 - boot) / 512  ; first sector of the file
         dq (fs_data.%1.end - fs_data.%1)   ; file size
 
         align 512, db 0 ; align to sector size

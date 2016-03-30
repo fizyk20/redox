@@ -1,15 +1,24 @@
 use alloc::boxed::Box;
 
+use collections::string::String;
+
 use common::event;
 
-use drivers::pio::*;
+use drivers::io::{Io, Pio};
 
-use schemes::KScheme;
+use fs::KScheme;
+
+#[repr(packed)]
+struct SerialInfo {
+    pub ports: [u16; 4],
+}
+
+const SERIALINFO: *const SerialInfo = 0x400 as *const SerialInfo;
 
 /// Serial
 pub struct Serial {
-    pub data: Pio8,
-    pub status: Pio8,
+    pub data: Pio<u8>,
+    pub status: Pio<u8>,
     pub irq: u8,
     pub escape: bool,
     pub cursor_control: bool,
@@ -18,9 +27,18 @@ pub struct Serial {
 impl Serial {
     /// Create new
     pub fn new(port: u16, irq: u8) -> Box<Self> {
+        Pio::<u8>::new(port + 1).write(0x00);
+        Pio::<u8>::new(port + 3).write(0x80);
+        Pio::<u8>::new(port + 0).write(0x03);
+        Pio::<u8>::new(port + 1).write(0x00);
+        Pio::<u8>::new(port + 3).write(0x03);
+        Pio::<u8>::new(port + 2).write(0xC7);
+        Pio::<u8>::new(port + 4).write(0x0B);
+        Pio::<u8>::new(port + 1).write(0x01);
+
         box Serial {
-            data: Pio8::new(port),
-            status: Pio8::new(port + 5),
+            data: Pio::<u8>::new(port),
+            status: Pio::<u8>::new(port + 5),
             irq: irq,
             escape: false,
             cursor_control: false,
@@ -31,12 +49,12 @@ impl Serial {
 impl KScheme for Serial {
     fn on_irq(&mut self, irq: u8) {
         if irq == self.irq {
-            while unsafe { self.status.read() } & 1 == 0 {
-                break;
-            }
+            while self.status.read() & 1 == 0 {}
 
-            let mut c = unsafe { self.data.read() } as char;
+            let mut c = self.data.read() as char;
             let mut sc = 0;
+
+            let mut console = ::env().console.lock();
 
             if self.escape {
                 self.escape = false;
@@ -60,23 +78,30 @@ impl KScheme for Serial {
                 }
 
                 c = '\0';
+            } else if c == '\x03' {
+                console.write(b"^C\n");
+                console.commands.send(String::new());
+
+                c = '\0';
+                sc = 0;
             } else if c == '\x1B' {
                 self.escape = true;
                 c = '\0';
             } else if c == '\r' {
                 c = '\n';
             } else if c == '\x7F' {
-                sc = event::K_BKSP;
                 c = '\0';
+                sc = event::K_BKSP;
             }
 
             if c != '\0' || sc != 0 {
-                event::KeyEvent {
+                let key_event = event::KeyEvent {
                     character: c,
                     scancode: sc,
                     pressed: true,
-                }
-                .trigger();
+                };
+
+                console.event(key_event.to_event());
             }
         }
     }

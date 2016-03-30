@@ -1,15 +1,18 @@
 use alloc::boxed::Box;
 
+use arch::context::context_switch;
+use arch::memory;
+
 use core::{cmp, ptr, mem};
 
-use common::memory;
-use schemes::{Resource, ResourceSeek, Url};
-use common::time::{self, Duration};
+use common::time;
 
-use drivers::pciconfig::PciConfig;
-use drivers::pio::*;
+use drivers::pci::config::PciConfig;
+use drivers::io::{Io, Pio};
 
-use schemes::KScheme;
+use fs::{KScheme, Resource, Url};
+
+use syscall::{do_sys_nanosleep, Result, TimeSpec};
 
 #[repr(packed)]
 struct BD {
@@ -17,49 +20,53 @@ struct BD {
     samples: u32,
 }
 
-struct AC97Resource {
+struct Ac97Resource {
     audio: usize,
     bus_master: usize,
 }
 
-impl Resource for AC97Resource {
-    fn dup(&self) -> Option<Box<Resource>> {
-        Some(box AC97Resource {
+impl Resource for Ac97Resource {
+    fn dup(&self) -> Result<Box<Resource>> {
+        Ok(box Ac97Resource {
             audio: self.audio,
             bus_master: self.bus_master,
         })
     }
 
-    fn url(&self) -> Url {
-        Url::from_str("audio:")
+    fn path(&self, buf: &mut [u8]) -> Result <usize> {
+        let path = b"audio:";
+
+        let mut i = 0;
+        while i < buf.len() && i < path.len() {
+            buf[i] = path[i];
+            i += 1;
+        }
+
+        Ok(i)
     }
 
-    fn read(&mut self, _: &mut [u8]) -> Option<usize> {
-        None
-    }
-
-    fn write(&mut self, buf: &[u8]) -> Option<usize> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
         unsafe {
             let audio = self.audio as u16;
 
-            let mut master_volume = Pio16::new(audio + 2);
-            let mut pcm_volume = Pio16::new(audio + 0x18);
+            let mut master_volume = Pio::<u16>::new(audio + 2);
+            let mut pcm_volume = Pio::<u16>::new(audio + 0x18);
 
             master_volume.write(0x808);
             pcm_volume.write(0x808);
 
             let bus_master = self.bus_master as u16;
 
-            let mut po_bdbar = Pio32::new(bus_master + 0x10);
-            let po_civ = Pio8::new(bus_master + 0x14);
-            let mut po_lvi = Pio8::new(bus_master + 0x15);
-            let mut po_cr = Pio8::new(bus_master + 0x1B);
+            let mut po_bdbar = Pio::<u32>::new(bus_master + 0x10);
+            let po_civ = Pio::<u8>::new(bus_master + 0x14);
+            let mut po_lvi = Pio::<u8>::new(bus_master + 0x15);
+            let mut po_cr = Pio::<u8>::new(bus_master + 0x1B);
 
             loop {
                 if po_cr.read() & 1 == 0 {
                     break;
                 }
-                Duration::new(0, 10 * time::NANOS_PER_MILLI).sleep();
+                context_switch();
             }
 
             po_cr.write(0);
@@ -99,10 +106,23 @@ impl Resource for AC97Resource {
                     if po_civ.read() != lvi as u8 {
                         break;
                     }
-                    Duration::new(0, 10 * time::NANOS_PER_MILLI).sleep();
+
+                    let req = TimeSpec {
+                        tv_sec: 0,
+                        tv_nsec: 10 * time::NANOS_PER_MILLI
+                    };
+                    let mut rem = TimeSpec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    try!(do_sys_nanosleep(&req, &mut rem));
                 }
 
-                debug!("{} / {}: {} / {}\n", po_civ.read(), lvi as usize, position, buf.len());
+                debug!("{} / {}: {} / {}\n",
+                       po_civ.read(),
+                       lvi as usize,
+                       position,
+                       buf.len());
 
                 let bytes = cmp::min(65534 * 2, (buf.len() - position + 1));
                 let samples = bytes / 2;
@@ -140,37 +160,38 @@ impl Resource for AC97Resource {
                     po_cr.write(0);
                     break;
                 }
-                Duration::new(0, 10 * time::NANOS_PER_MILLI).sleep();
+
+                let req = TimeSpec {
+                    tv_sec: 0,
+                    tv_nsec: 10 * time::NANOS_PER_MILLI
+                };
+                let mut rem = TimeSpec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                try!(do_sys_nanosleep(&req, &mut rem));
             }
 
             debug!("Finished {} / {}\n", po_civ.read(), lvi);
         }
 
-        Some(buf.len())
-    }
-
-    fn seek(&mut self, _: ResourceSeek) -> Option<usize> {
-        None
-    }
-
-    fn sync(&mut self) -> bool {
-        false
+        Ok(buf.len())
     }
 }
 
-pub struct AC97 {
+pub struct Ac97 {
     pub audio: usize,
     pub bus_master: usize,
     pub irq: u8,
 }
 
-impl KScheme for AC97 {
+impl KScheme for Ac97 {
     fn scheme(&self) -> &str {
         "audio"
     }
 
-    fn open(&mut self, _: &Url, _: usize) -> Option<Box<Resource>> {
-        Some(box AC97Resource {
+    fn open(&mut self, _: Url, _: usize) -> Result<Box<Resource>> {
+        Ok(box Ac97Resource {
             audio: self.audio,
             bus_master: self.bus_master,
         })
@@ -181,22 +202,19 @@ impl KScheme for AC97 {
             // d("AC97 IRQ\n");
         }
     }
-
-    fn on_poll(&mut self) {
-    }
 }
 
-impl AC97 {
-    pub unsafe fn new(mut pci: PciConfig) -> Box<AC97> {
+impl Ac97 {
+    pub unsafe fn new(mut pci: PciConfig) -> Box<Ac97> {
         pci.flag(4, 4, true); // Bus mastering
 
-        let module = box AC97 {
+        let module = box Ac97 {
             audio: pci.read(0x10) as usize & 0xFFFFFFF0,
             bus_master: pci.read(0x14) as usize & 0xFFFFFFF0,
             irq: pci.read(0x3C) as u8 & 0xF,
         };
 
-        debug!("AC97 on: {:X}, {:X}, IRQ: {:X}\n", module.audio, module.bus_master, module.irq);
+        debug!(" + AC97 on: {:X}, {:X}, IRQ: {:X}\n", module.audio, module.bus_master, module.irq);
 
         module
     }

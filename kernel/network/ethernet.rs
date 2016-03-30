@@ -1,4 +1,4 @@
-use common::get_slice::GetSlice;
+use common::slice::GetSlice;
 
 use collections::slice;
 use collections::vec::Vec;
@@ -26,7 +26,7 @@ impl FromBytes for EthernetII {
             unsafe {
                 return Some(EthernetII {
                     header: *(bytes.as_ptr() as *const EthernetIIHeader),
-                    data: bytes.get_slice(Some(mem::size_of::<EthernetIIHeader>()), None).to_vec(),
+                    data: bytes.get_slice(mem::size_of::<EthernetIIHeader>() ..).to_vec(),
                 });
             }
         }
@@ -40,7 +40,7 @@ impl ToBytes for EthernetII {
             let header_ptr: *const EthernetIIHeader = &self.header;
             let mut ret = Vec::from(slice::from_raw_parts(header_ptr as *const u8,
                                                           mem::size_of::<EthernetIIHeader>()));
-            ret.push_all(&self.data);
+            ret.extend_from_slice(&self.data);
             ret
         }
     }

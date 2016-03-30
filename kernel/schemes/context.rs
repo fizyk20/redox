@@ -1,9 +1,12 @@
 use alloc::boxed::Box;
 
-use scheduler::context;
-use scheduler;
+use collections::string::{String, ToString};
 
-use schemes::{KScheme, Resource, Url, VecResource};
+use arch::context;
+
+use fs::{KScheme, Resource, Url, VecResource};
+
+use system::error::Result;
 
 pub struct ContextScheme;
 
@@ -12,39 +15,73 @@ impl KScheme for ContextScheme {
         "context"
     }
 
-    fn open(&mut self, _: &Url, _: usize) -> Option<Box<Resource>> {
-        let mut string = format!("{:<6}{:<8}{:<6}{}", "PID", "MEM", "FDS", "NAME");
-        unsafe {
-            let reenable = scheduler::start_no_ints();
-            let mut i = 0;
-            for context in (*context::contexts_ptr).iter() {
+    fn open(&mut self, _: Url, _: usize) -> Result<Box<Resource>> {
+        let mut string = format!("{:<6}{:<6}{:<8}{:<8}{:<8}{:<6}{:<6}{:<6}{}\n",
+                                 "PID",
+                                 "PPID",
+                                 "SWITCH",
+                                 "TIME",
+                                 "MEM",
+                                 "FDS",
+                                 "FLG",
+                                 "IOPL",
+                                 "NAME");
+        {
+            let contexts = ::env().contexts.lock();
+            for context in contexts.iter() {
                 let mut memory = 0;
-                for context_memory in (*context.memory.get()).iter() {
-                    memory += context_memory.virtual_size;
+                if context.kernel_stack > 0 {
+                    memory += context::CONTEXT_STACK_SIZE;
                 }
+                if let Some(ref stack) = context.stack {
+                    memory += stack.virtual_size;
+                }
+                memory += unsafe { (*context.image.get()).size() };
+                memory += unsafe { (*context.heap.get()).size() };
+                memory += unsafe { (*context.mmap.get()).size() };
 
-                let memory_string = if memory > 1024 * 1024 * 1024 {
+                let memory_string = if memory >= 1024 * 1024 * 1024 {
                     format!("{} GB", memory / 1024 / 1024 / 1024)
-                } else if memory > 1024 * 1024 {
+                } else if memory >= 1024 * 1024 {
                     format!("{} MB", memory / 1024 / 1024)
-                } else if memory > 1024 {
+                } else if memory >= 1024 {
                     format!("{} KB", memory / 1024)
                 } else {
                     format!("{} B", memory)
                 };
 
-                let line = format!("{:<6}{:<8}{:<6}{}",
-                                   i,
-                                   memory_string,
-                                   (*context.files.get()).len(),
-                                   context.name);
+                let mut flags_string = String::new();
+                if context.stack.is_some() {
+                    flags_string.push('U');
+                } else {
+                    flags_string.push('K');
+                }
+                if context.blocked {
+                    flags_string.push('B');
+                }
+                if context.exited {
+                    flags_string.push('E');
+                }
+                if context.vfork.is_some() {
+                    flags_string.push('V');
+                }
+                if context.wake.is_some() {
+                    flags_string.push('S');
+                }
 
-                string = string + "\n" + &line;
-                i += 1;
+                string.push_str(&format!("{:<6}{:<6}{:<8}{:<8}{:<8}{:<6}{:<6}{:<6}{}\n",
+                                   context.pid,
+                                   context.ppid,
+                                   context.switch,
+                                   context.time,
+                                   memory_string,
+                                   unsafe { (*context.files.get()).len() },
+                                   flags_string,
+                                   context.iopl,
+                                   context.name));
             }
-            scheduler::end_no_ints(reenable);
         }
 
-        Some(box VecResource::new(Url::from_str("context:"), string.into_bytes()))
+        Ok(box VecResource::new("context:".to_string(), string.into_bytes()))
     }
 }

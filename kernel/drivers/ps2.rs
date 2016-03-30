@@ -4,18 +4,49 @@ use core::cmp;
 
 use common::event::{KeyEvent, MouseEvent};
 
-use drivers::pio::*;
+use drivers::io::{Io, Pio, ReadOnly, WriteOnly};
 
-use schemes::KScheme;
+use graphics::display::VBEMODEINFO;
+
+use fs::KScheme;
 
 use drivers::kb_layouts::layouts;
 
+pub struct Ps2Keyboard<'a> {
+    bus: &'a mut Ps2
+}
+
+impl<'a> Ps2Keyboard<'a> {
+    //TODO: Use result
+    fn cmd(&mut self, command: u8) -> u8 {
+        self.bus.wait_write();
+        self.bus.data.write(command);
+        self.bus.wait_read();
+        self.bus.data.read()
+    }
+}
+
+pub struct Ps2Mouse<'a> {
+    bus: &'a mut Ps2
+}
+
+impl<'a> Ps2Mouse<'a> {
+    //TODO: Use result
+    fn cmd(&mut self, command: u8) -> u8 {
+        self.bus.write(0xD4, command);
+        self.bus.wait_read();
+        self.bus.data.read()
+    }
+}
+
 /// PS2
 pub struct Ps2 {
-    /// The data
-    data: Pio8,
-    /// The command
-    cmd: Pio8,
+    /// The data register
+    data: Pio<u8>,
+    /// The status register
+    sts: ReadOnly<u8, Pio<u8>>,
+    /// The command register
+    cmd: WriteOnly<u8, Pio<u8>>,
     /// Left shift?
     lshift: bool,
     /// Right shift?
@@ -24,14 +55,16 @@ pub struct Ps2 {
     caps_lock: bool,
     /// Caps lock toggle
     caps_lock_toggle: bool,
+    /// AltGr?
+    altgr: bool,
     /// The mouse packet
     mouse_packet: [u8; 4],
     /// Mouse packet index
     mouse_i: usize,
     /// Mouse point x
-    mouse_x: isize,
+    mouse_x: i32,
     /// Mouse point y
-    mouse_y: isize,
+    mouse_y: i32,
     /// Layout for keyboard
     /// Default: English
     layout: layouts::Layout,
@@ -41,82 +74,153 @@ impl Ps2 {
     /// Create new PS2 data
     pub fn new() -> Box<Self> {
         let mut module = box Ps2 {
-            data: Pio8::new(0x60),
-            cmd: Pio8::new(0x64),
+            data: Pio::new(0x60),
+            sts: ReadOnly::new(Pio::new(0x64)),
+            cmd: WriteOnly::new(Pio::new(0x64)),
             lshift: false,
             rshift: false,
             caps_lock: false,
             caps_lock_toggle: false,
+            altgr: false,
             mouse_packet: [0; 4],
             mouse_i: 0,
             mouse_x: 0,
             mouse_y: 0,
-            layout: layouts::Layout::ENGLISH,
+            layout: layouts::Layout::English,
         };
 
-        unsafe {
-            module.keyboard_init();
-            module.mouse_init();
-        }
+        module.init();
 
         module
     }
 
-    unsafe fn wait0(&self) {
-        while (self.cmd.read() & 1) == 0 {}
+    fn wait_read(&self) {
+        while ! self.sts.readf(1) {}
     }
 
-    unsafe fn wait1(&self) {
-        while (self.cmd.read() & 2) == 2 {}
+    fn wait_write(&self) {
+        while self.sts.readf(2) {}
     }
 
-    unsafe fn keyboard_init(&mut self) {
-        while (self.cmd.read() & 0x1) == 1 {
+    fn cmd(&mut self, command: u8) {
+        self.wait_write();
+        self.cmd.write(command);
+    }
+
+    fn read(&mut self, command: u8) -> u8 {
+        self.cmd(command);
+        self.wait_read();
+        self.data.read()
+    }
+
+    fn write(&mut self, command: u8, data: u8) {
+        self.cmd(command);
+        self.wait_write();
+        self.data.write(data);
+    }
+
+    fn keyboard<'a>(&'a mut self) -> Ps2Keyboard<'a> {
+        Ps2Keyboard {
+            bus: self
+        }
+    }
+
+    fn mouse<'a>(&'a mut self) -> Ps2Mouse<'a> {
+        Ps2Mouse {
+            bus: self
+        }
+    }
+
+    fn init(&mut self) {
+        while self.sts.readf(1) {
             self.data.read();
         }
 
-        self.wait1();
-        self.cmd.write(0x20);
-        self.wait0();
-        let flags = (self.data.read() & 0b00110111) | 1 | 0b10000;
-        self.wait1();
-        self.cmd.write(0x60);
-        self.wait1();
-        self.data.write(flags);
+        debugln!(" + PS/2");
 
-        // Set Defaults
-        self.wait1();
-        self.data.write(0xF6);
-        self.wait0();
-        self.data.read();
+        // No interrupts, system flag set, clocks enabled, translation enabled
+        self.write(0x60, 0b01000100);
 
-        // Set LEDS
-        self.wait1();
-        self.data.write(0xED);
-        self.wait0();
-        self.data.read();
+        while self.sts.readf(1) {
+            debugln!("Extra {}: {:X}", line!(), self.data.read());
+        }
 
-        self.wait1();
-        self.data.write(0);
-        self.wait0();
-        self.data.read();
+        // Enable First Port
+        debugln!("   + Keyboard");
+        self.cmd(0xAE);
 
-        // Set Scancode Map:
-        self.wait1();
-        self.data.write(0xF0);
-        self.wait0();
-        self.data.read();
+        while self.sts.readf(1) {
+            debugln!("Extra {}: {:X}", line!(), self.data.read());
+        }
 
-        self.wait1();
-        self.data.write(1);
-        self.wait0();
-        self.data.read();
+        {
+            // Reset
+            debug!("     - Reset {:X}", self.keyboard().cmd(0xFF));
+            self.wait_read();
+            debugln!(", {:X}", self.data.read());
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+
+            // Set defaults
+            debugln!("     - Set defaults {:X}", self.keyboard().cmd(0xF6));
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+
+            // Enable Streaming
+            debugln!("     - Enable streaming {:X}", self.keyboard().cmd(0xF4));
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+        }
+
+        // Enable Second Port
+        debugln!("   + PS/2 Mouse");
+        self.cmd(0xA8);
+
+        while self.sts.readf(1) {
+            debugln!("Extra {}: {:X}", line!(), self.data.read());
+        }
+
+        {
+            // Reset
+            debug!("     - Reset {:X}", self.keyboard().cmd(0xFF));
+            self.wait_read();
+            debugln!(", {:X}", self.data.read());
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+
+            // Set defaults
+            debugln!("     - Set defaults {:X}", self.mouse().cmd(0xF6));
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+
+            // Enable Streaming
+            debugln!("     - Enable streaming {:X}", self.mouse().cmd(0xF4));
+
+            while self.sts.readf(1) {
+                debugln!("Extra {}: {:X}", line!(), self.data.read());
+            }
+        }
+
+        // Key and mouse interrupts, system flag set, clocks enabled, translation enabled
+        self.write(0x60, 0b01000111);
+
+        while self.sts.readf(1) {
+            debugln!("Extra {}: {:X}", line!(), self.data.read());
+        }
     }
 
     /// Keyboard interrupt
-    pub fn keyboard_interrupt(&mut self) -> Option<KeyEvent> {
-        let scancode = unsafe { self.data.read() };
-
+    pub fn keyboard_interrupt(&mut self, mut scancode: u8) -> Option<KeyEvent> {
         if scancode == 0 {
             return None;
         } else if scancode == 0x2A {
@@ -138,57 +242,28 @@ impl Ps2 {
             if self.caps_lock && !self.caps_lock_toggle {
                 self.caps_lock = false;
             }
+        } else if scancode == 0xE0 {
+            let scancode_byte_2 = self.data.read();
+            if scancode_byte_2 == 0x38 {
+                self.altgr = true;
+            } else if scancode_byte_2 == 0xB8 {
+                self.altgr = false;
+            } else {
+                scancode = scancode_byte_2;
+            }
         }
 
-        let shift;
-        if self.caps_lock {
-            shift = !(self.lshift || self.rshift);
-        } else {
-            shift = self.lshift || self.rshift;
-        }
+        let shift = self.caps_lock != (self.lshift || self.rshift);
 
         return Some(KeyEvent {
-            character: layouts::char_for_scancode(scancode & 0x7F, shift, &self.layout),
+            character: layouts::char_for_scancode(scancode & 0x7F, shift, self.altgr, &self.layout),
             scancode: scancode & 0x7F,
             pressed: scancode < 0x80,
         });
     }
 
-    unsafe fn mouse_cmd(&mut self, byte: u8) -> u8 {
-        self.wait1();
-        self.cmd.write(0xD4);
-        self.wait1();
-        self.data.write(byte);
-
-        self.wait0();
-        self.data.read()
-    }
-
-    /// Initialize mouse
-    pub unsafe fn mouse_init(&mut self) {
-        // The Init Dance
-        self.wait1();
-        self.cmd.write(0xA8);
-
-        self.wait1();
-        self.cmd.write(0x20);
-        self.wait0();
-        let status = self.data.read() | 2;
-        self.wait1();
-        self.cmd.write(0x60);
-        self.wait1();
-        self.data.write(status);
-
-        // Set defaults
-        self.mouse_cmd(0xF6);
-
-        // Enable Streaming
-        self.mouse_cmd(0xF4);
-    }
-
     /// Mouse interrupt
-    pub fn mouse_interrupt(&mut self) -> Option<MouseEvent> {
-        let byte = unsafe { self.data.read() };
+    pub fn mouse_interrupt(&mut self, byte: u8) -> Option<MouseEvent> {
         if self.mouse_i == 0 {
             if byte & 0x8 == 0x8 {
                 self.mouse_packet[0] = byte;
@@ -207,27 +282,23 @@ impl Ps2 {
 
             let x;
             if (self.mouse_packet[0] & 0x40) != 0x40 && self.mouse_packet[1] != 0 {
-                x = self.mouse_packet[1] as isize -
-                    (((self.mouse_packet[0] as isize) << 4) & 0x100);
+                x = (self.mouse_packet[1] as isize -
+                     (((self.mouse_packet[0] as isize) << 4) & 0x100)) as i32;
             } else {
                 x = 0;
             }
 
             let y;
             if (self.mouse_packet[0] & 0x80) != 0x80 && self.mouse_packet[2] != 0 {
-                y = (((self.mouse_packet[0] as isize) << 3) & 0x100) -
-                    self.mouse_packet[2] as isize;
+                y = ((((self.mouse_packet[0] as isize) << 3) & 0x100) -
+                     self.mouse_packet[2] as isize) as i32;
             } else {
                 y = 0;
             }
 
-            unsafe {
-                self.mouse_x = cmp::max(0,
-                                        cmp::min((*::console).display.width as isize,
-                                                 self.mouse_x + x));
-                self.mouse_y = cmp::max(0,
-                                        cmp::min((*::console).display.height as isize,
-                                                 self.mouse_y + y));
+            if let Some(mode_info) = unsafe { VBEMODEINFO } {
+                self.mouse_x = cmp::max(0, cmp::min(mode_info.xresolution as i32, self.mouse_x + x));
+                self.mouse_y = cmp::max(0, cmp::min(mode_info.yresolution as i32, self.mouse_y + y));
             }
 
             self.mouse_i = 0;
@@ -246,35 +317,41 @@ impl Ps2 {
 
     /// Function to change the layout of the keyboard
     pub fn change_layout(&mut self, layout: usize) {
-        self.layout =
-            match layout {
-                0 => layouts::Layout::ENGLISH,
-                1 => layouts::Layout::FRENCH,
-                _ => layouts::Layout::ENGLISH
-            }
+        self.layout = match layout {
+            0 => layouts::Layout::English,
+            1 => layouts::Layout::French,
+            2 => layouts::Layout::German,
+            _ => layouts::Layout::English,
+        }
     }
 }
 
 impl KScheme for Ps2 {
     fn on_irq(&mut self, irq: u8) {
-        if irq == 0x1 || irq == 0xC {
-            self.on_poll();
-        }
-    }
-
-    fn on_poll(&mut self) {
-        loop {
-            let status = unsafe { self.cmd.read() };
-            if status & 0x21 == 1 {
-                if let Some(key_event) = self.keyboard_interrupt() {
-                    key_event.trigger();
+        if irq == 0xC || irq == 0x1 {
+            loop {
+                let status = self.sts.read();
+                if status & 0x21 == 0x21 {
+                    let data = self.data.read();
+                    if let Some(mouse_event) = self.mouse_interrupt(data) {
+                        if ::env().console.lock().draw {
+                            //Ignore mouse event
+                        } else {
+                            ::env().events.send(mouse_event.to_event());
+                        }
+                    }
+                } else if status & 0x21 == 0x01 {
+                    let data = self.data.read();
+                    if let Some(key_event) = self.keyboard_interrupt(data) {
+                        if ::env().console.lock().draw {
+                            ::env().console.lock().event(key_event.to_event());
+                        } else {
+                            ::env().events.send(key_event.to_event());
+                        }
+                    }
+                } else {
+                    break;
                 }
-            } else if status & 0x21 == 0x21 {
-                if let Some(mouse_event) = self.mouse_interrupt() {
-                    mouse_event.trigger();
-                }
-            } else {
-                break;
             }
         }
     }
