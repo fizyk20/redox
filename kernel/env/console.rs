@@ -3,11 +3,10 @@ use alloc::boxed::Box;
 use collections::String;
 use collections::Vec;
 
+use common::debug::SerialConsole;
 use common::event::{self, Event, EventOption};
 
 use core::{cmp, mem};
-
-use drivers::io::{Io, Pio};
 
 use graphics::color::Color;
 use graphics::display::Display;
@@ -313,7 +312,7 @@ RAW MODE
                 if key_event.pressed {
                     if self.raw_mode {
                         match key_event.scancode {
-                            event::K_BKSP => self.command.push_str("\x08"),
+                            event::K_BKSP => self.command.push_str("\x7F"),
                             event::K_UP => self.command.push_str("\x1B[A"),
                             event::K_DOWN => self.command.push_str("\x1B[B"),
                             event::K_RIGHT => self.command.push_str("\x1B[C"),
@@ -371,22 +370,10 @@ RAW MODE
             } else {
                 self.character(c);
             }
+        }
 
-            if self.display.is_none() || ! self.draw {
-                let serial_status = Pio::<u8>::new(0x3F8 + 5);
-                let mut serial_data = Pio::<u8>::new(0x3F8);
-
-                while !serial_status.readf(0x20) {}
-                serial_data.write(*byte);
-
-                if *byte == 8 {
-                    while !serial_status.readf(0x20) {}
-                    serial_data.write(0x20);
-
-                    while !serial_status.readf(0x20) {}
-                    serial_data.write(8);
-                }
-            }
+        if self.display.is_none() || ! self.draw {
+            SerialConsole::new().write(bytes);
         }
 
         if self.draw && self.redraw {

@@ -2,42 +2,41 @@ use arch::context::{context_switch, Context};
 
 use collections::Vec;
 
+use core::cell::UnsafeCell;
 use core::mem;
 use core::ops::DerefMut;
 
-use super::Intex;
-
 pub struct WaitCondition {
-    contexts: Intex<Vec<*mut Context>>
+    contexts: UnsafeCell<Vec<*mut Context>>
 }
 
 impl WaitCondition {
     pub fn new() -> WaitCondition {
         WaitCondition {
-            contexts: Intex::new(Vec::new())
+            contexts: UnsafeCell::new(Vec::new())
         }
     }
 
-    pub unsafe fn notify(&self) {
+    pub fn notify(&self) {
         let mut contexts = Vec::new();
-        mem::swap(self.contexts.lock().deref_mut(), &mut contexts);
+        mem::swap(unsafe { &mut *self.contexts.get() }, &mut contexts);
         for &context in contexts.iter() {
-            (*context).blocked = false;
+            unsafe { (*context).blocked = false; }
         }
     }
 
-    pub unsafe fn wait(&self) {
-        if let Ok(mut context) = ::env().contexts.lock().current_mut() {
-            let mut contexts = self.contexts.lock();
+    pub fn wait(&self) {
+        if let Ok(mut context) = unsafe { &mut *::env().contexts.get() }.current_mut() {
+            let mut contexts = unsafe { &mut *self.contexts.get() };
             contexts.push(context.deref_mut() as *mut Context);
             (*context).blocked = true;
         }
-        context_switch();
+        unsafe { context_switch(); }
     }
 }
 
 impl Drop for WaitCondition {
     fn drop(&mut self){
-        unsafe { self.notify(); }
+        self.notify();
     }
 }

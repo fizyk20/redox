@@ -7,17 +7,17 @@ use collections::borrow::ToOwned;
 use core::cell::Cell;
 use core::mem::size_of;
 use core::ops::DerefMut;
-use core::ptr;
+use core::{ptr, slice};
 
 use arch::context::{Context, ContextMemory};
 
 use sync::{WaitMap, WaitQueue};
 
-use system::error::{Error, Result, EBADF, EFAULT, EINVAL, ENOENT, ESPIPE};
+use system::error::{Error, Result, EBADF, EFAULT, EINVAL, ENODEV, ESPIPE};
 use system::scheme::Packet;
-use system::syscall::{SYS_CLOSE, SYS_FPATH, SYS_FSYNC, SYS_FTRUNCATE,
-                    SYS_LSEEK, SEEK_SET, SEEK_CUR, SEEK_END, SYS_MKDIR,
-                    SYS_OPEN, SYS_READ, SYS_WRITE, SYS_RMDIR, SYS_UNLINK};
+use system::syscall::{SYS_CLOSE, SYS_DUP, SYS_FPATH, SYS_FSTAT, SYS_FSYNC, SYS_FTRUNCATE,
+                    SYS_OPEN, SYS_LSEEK, SEEK_SET, SEEK_CUR, SEEK_END, SYS_MKDIR,
+                    SYS_READ, SYS_WRITE, SYS_RMDIR, SYS_STAT, SYS_UNLINK, Stat};
 
 use super::{Resource, ResourceSeek, KScheme, Url};
 
@@ -60,14 +60,48 @@ impl SchemeInner {
             });
             Error::demux(scheme.done.receive(&id).0)
         } else {
-            Err(Error::new(EBADF))
+            Err(Error::new(ENODEV))
+        }
+    }
+
+    fn capture(inner: &Weak<SchemeInner>, mut physical_address: usize, size: usize, writeable: bool) -> Result<usize> {
+        if let Some(scheme) = inner.upgrade() {
+            if physical_address >= 0x80000000 {
+                physical_address -= 0x80000000;
+            }
+            unsafe {
+                let mmap = &mut *(*scheme.context).mmap.get();
+                let virtual_address = mmap.next_mem();
+                mmap.memory.push(ContextMemory {
+                    physical_address: physical_address,
+                    virtual_address: virtual_address,
+                    virtual_size: size,
+                    writeable: writeable,
+                    allocated: false,
+                });
+                return Ok(virtual_address);
+            }
+        } else {
+            return Err(Error::new(ENODEV));
+        }
+    }
+
+    fn release(inner: &Weak<SchemeInner>, virtual_address: usize) {
+        if let Some(scheme) = inner.upgrade() {
+            unsafe {
+                let mmap = &mut *(*scheme.context).mmap.get();
+                if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
+                    mem.virtual_size = 0;
+                }
+                mmap.clean_mem();
+            }
         }
     }
 }
 
 impl Drop for SchemeInner {
     fn drop(&mut self) {
-        ::env().schemes.lock().retain(|scheme| scheme.scheme() != self.name);
+        unsafe { &mut *::env().schemes.get() }.retain(|scheme| scheme.scheme() != self.name);
     }
 }
 
@@ -80,151 +114,88 @@ impl SchemeResource {
     fn call(&self, a: usize, b: usize, c: usize, d: usize) -> Result<usize> {
         SchemeInner::call(&self.inner, a, b, c, d)
     }
+
+    fn capture(&self, physical_address: usize, size: usize, writeable: bool) -> Result<usize> {
+        SchemeInner::capture(&self.inner, physical_address, size, writeable)
+    }
+
+    fn release(&self, virtual_address: usize){
+        SchemeInner::release(&self.inner, virtual_address);
+    }
 }
 
 impl Resource for SchemeResource {
     /// Duplicate the resource
     fn dup(&self) -> Result<Box<Resource>> {
-        Err(Error::new(EBADF))
+        let file_id = try!(self.call(SYS_DUP, self.file_id, 0, 0));
+        Ok(Box::new(SchemeResource {
+            inner: self.inner.clone(),
+            file_id: file_id
+        }))
     }
 
     /// Return the url of this resource
     fn path(&self, buf: &mut [u8]) -> Result <usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
 
-            let mut virtual_address = 0;
-            let virtual_size = (buf.len() + offset + 4095)/4096 * 4096;
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    virtual_address = mmap.next_mem();
-                    mmap.memory.push(ContextMemory {
-                        physical_address: physical_address - offset,
-                        virtual_address: virtual_address,
-                        virtual_size: virtual_size,
-                        writeable: true,
-                        allocated: false,
-                    });
-                }
-            }
+            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
 
-            if virtual_address > 0 {
-                let result = self.call(SYS_FPATH, self.file_id, virtual_address + offset, buf.len());
+            let result = self.call(SYS_FPATH, self.file_id, virtual_address + offset, buf.len());
 
-                //debugln!("Read {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
+            //debugln!("Read {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
 
-                if let Some(scheme) = self.inner.upgrade() {
-                    unsafe {
-                        let mmap = &mut *(*scheme.context).mmap.get();
-                        if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                            mem.virtual_size = 0;
-                        }
-                        mmap.clean_mem();
-                    }
-                }
+            self.release(virtual_address);
 
-                result
-            } else {
-                Err(Error::new(EBADF))
-            }
+            result
         } else {
+            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
             Err(Error::new(EFAULT))
         }
     }
 
     /// Read data to buffer
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
 
-            let mut virtual_address = 0;
-            let virtual_size = (buf.len() + offset + 4095)/4096 * 4096;
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    virtual_address = mmap.next_mem();
-                    mmap.memory.push(ContextMemory {
-                        physical_address: physical_address - offset,
-                        virtual_address: virtual_address,
-                        virtual_size: virtual_size,
-                        writeable: true,
-                        allocated: false,
-                    });
-                }
-            }
+            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
 
-            if virtual_address > 0 {
-                let result = self.call(SYS_READ, self.file_id, virtual_address + offset, buf.len());
+            let result = self.call(SYS_READ, self.file_id, virtual_address + offset, buf.len());
 
-                //debugln!("Read {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
+            //debugln!("Read {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
 
-                if let Some(scheme) = self.inner.upgrade() {
-                    unsafe {
-                        let mmap = &mut *(*scheme.context).mmap.get();
-                        if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                            mem.virtual_size = 0;
-                        }
-                        mmap.clean_mem();
-                    }
-                }
+            self.release(virtual_address);
 
-                result
-            } else {
-                Err(Error::new(EBADF))
-            }
+            result
         } else {
+            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
             Err(Error::new(EFAULT))
         }
     }
 
     /// Write to resource
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
 
-            let mut virtual_address = 0;
-            let virtual_size = (buf.len() + offset + 4095)/4096 * 4096;
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    virtual_address = mmap.next_mem();
-                    mmap.memory.push(ContextMemory {
-                        physical_address: physical_address - offset,
-                        virtual_address: virtual_address,
-                        virtual_size: virtual_size,
-                        writeable: false,
-                        allocated: false,
-                    });
-                }
-            }
+            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, false));
 
-            if virtual_address > 0 {
-                let result = self.call(SYS_WRITE, self.file_id, virtual_address + offset, buf.len());
+            let result = self.call(SYS_WRITE, self.file_id, virtual_address + offset, buf.len());
 
-                //debugln!("Write {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
+            // debugln!("Write {:X} mapped from {:X} to {:X} offset {} length {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), result);
 
-                if let Some(scheme) = self.inner.upgrade() {
-                    unsafe {
-                        let mmap = &mut *(*scheme.context).mmap.get();
-                        if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                            mem.virtual_size = 0;
-                        }
-                        mmap.clean_mem();
-                    }
-                }
+            self.release(virtual_address);
 
-                result
-            } else {
-                Err(Error::new(EBADF))
-            }
+            result
         } else {
+            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
             Err(Error::new(EFAULT))
         }
     }
@@ -238,6 +209,28 @@ impl Resource for SchemeResource {
         };
 
         self.call(SYS_LSEEK, self.file_id, offset, whence)
+    }
+
+    /// Stat
+    fn stat(&self, stat: &mut Stat) -> Result<usize> {
+        let buf = unsafe { slice::from_raw_parts_mut(stat as *mut Stat as *mut u8, size_of::<Stat>()) };
+
+        let contexts = unsafe { & *::env().contexts.get() };
+        let current = try!(contexts.current());
+        if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
+            let offset = physical_address % 4096;
+
+            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
+
+            let result = self.call(SYS_FSTAT, self.file_id, virtual_address + offset, buf.len());
+
+            self.release(virtual_address);
+
+            result
+        } else {
+            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
+            Err(Error::new(EFAULT))
+        }
     }
 
     /// Sync the resource
@@ -298,7 +291,7 @@ impl Resource for SchemeServerResource {
             i += size_of::<Packet>();
 
             while i + size_of::<Packet>() <= buf.len() {
-                if let Some(packet) = self.inner.todo.inner.lock().pop_front() {
+                if let Some(packet) = unsafe { self.inner.todo.inner() }.pop_front() {
                     unsafe { ptr::write(buf.as_mut_ptr().offset(i as isize) as *mut Packet, packet); }
                     i += size_of::<Packet>();
                 } else {
@@ -352,7 +345,7 @@ pub struct Scheme {
 
 impl Scheme {
     pub fn new(name: &str) -> Result<(Box<Scheme>, Box<Resource>)> {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = unsafe { &mut *::env().contexts.get() };
         let mut current = try!(contexts.current_mut());
         let server = box SchemeServerResource {
             inner: Arc::new(SchemeInner::new(name, current.deref_mut()))
@@ -366,6 +359,14 @@ impl Scheme {
 
     fn call(&self, a: usize, b: usize, c: usize, d: usize) -> Result<usize> {
         SchemeInner::call(&self.inner, a, b, c, d)
+    }
+
+    fn capture(&self, physical_address: usize, size: usize, writeable: bool) -> Result<usize> {
+        SchemeInner::capture(&self.inner, physical_address, size, writeable)
+    }
+
+    fn release(&self, virtual_address: usize){
+        SchemeInner::release(&self.inner, virtual_address);
     }
 }
 
@@ -381,178 +382,79 @@ impl KScheme for Scheme {
     fn open(&mut self, url: Url, flags: usize) -> Result<Box<Resource>> {
         let c_str = url.to_string() + "\0";
 
-        let mut physical_address = c_str.as_ptr() as usize;
-        if physical_address >= 0x80000000 {
-            physical_address -= 0x80000000;
-        }
+        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
 
-        let mut virtual_address = 0;
-        let virtual_size = c_str.len();
-        if let Some(scheme) = self.inner.upgrade() {
-            unsafe {
-                let mmap = &mut *(*scheme.context).mmap.get();
-                virtual_address = mmap.next_mem();
-                mmap.memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: virtual_size,
-                    writeable: false,
-                    allocated: false,
-                });
-            }
-        }
+        let result = self.call(SYS_OPEN, virtual_address, flags, 0);
 
-        if virtual_address > 0 {
-            let result = self.call(SYS_OPEN, virtual_address, flags, 0);
+        self.release(virtual_address);
 
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                        mem.virtual_size = 0;
-                    }
-                    mmap.clean_mem();
-                }
-            }
-
-            match result {
-                Ok(file_id) => Ok(box SchemeResource {
-                    inner: self.inner.clone(),
-                    file_id: file_id,
-                }),
-                Err(err) => Err(err)
-            }
-        } else {
-            Err(Error::new(ENOENT))
+        match result {
+            Ok(file_id) => Ok(box SchemeResource {
+                inner: self.inner.clone(),
+                file_id: file_id,
+            }),
+            Err(err) => Err(err)
         }
     }
 
     fn mkdir(&mut self, url: Url, flags: usize) -> Result<()> {
         let c_str = url.to_string() + "\0";
 
-        let mut physical_address = c_str.as_ptr() as usize;
-        if physical_address >= 0x80000000 {
-            physical_address -= 0x80000000;
-        }
+        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
 
-        let mut virtual_address = 0;
-        let virtual_size = c_str.len();
-        if let Some(scheme) = self.inner.upgrade() {
-            unsafe {
-                let mmap = &mut *(*scheme.context).mmap.get();
-                virtual_address = mmap.next_mem();
-                mmap.memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: virtual_size,
-                    writeable: false,
-                    allocated: false,
-                });
-            }
-        }
+        let result = self.call(SYS_MKDIR, virtual_address, flags, 0);
 
-        if virtual_address > 0 {
-            let result = self.call(SYS_MKDIR, virtual_address, flags, 0);
+        self.release(virtual_address);
 
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                        mem.virtual_size = 0;
-                    }
-                    mmap.clean_mem();
-                }
-            }
-
-            result.and(Ok(()))
-        } else {
-            Err(Error::new(ENOENT))
-        }
+        result.and(Ok(()))
     }
 
     fn rmdir(&mut self, url: Url) -> Result<()> {
         let c_str = url.to_string() + "\0";
 
-        let mut physical_address = c_str.as_ptr() as usize;
-        if physical_address >= 0x80000000 {
-            physical_address -= 0x80000000;
-        }
+        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
 
-        let mut virtual_address = 0;
-        let virtual_size = c_str.len();
-        if let Some(scheme) = self.inner.upgrade() {
-            unsafe {
-                let mmap = &mut *(*scheme.context).mmap.get();
-                virtual_address = mmap.next_mem();
-                mmap.memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: virtual_size,
-                    writeable: false,
-                    allocated: false,
-                });
-            }
-        }
+        let result = self.call(SYS_RMDIR, virtual_address, 0, 0);
 
-        if virtual_address > 0 {
-            let result = self.call(SYS_RMDIR, virtual_address, 0, 0);
+        self.release(virtual_address);
 
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                        mem.virtual_size = 0;
-                    }
-                    mmap.clean_mem();
-                }
-            }
+        result.and(Ok(()))
+    }
+
+    fn stat(&mut self, url: Url, stat: &mut Stat) -> Result<()> {
+        let buf = unsafe { slice::from_raw_parts_mut(stat as *mut Stat as *mut u8, size_of::<Stat>()) };
+
+        let contexts = unsafe { & *::env().contexts.get() };
+        let current = try!(contexts.current());
+        if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
+            let offset = physical_address % 4096;
+
+            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
+
+            let c_str = url.to_string() + "\0";
+
+            let c_str_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
+
+            let result = self.call(SYS_STAT, c_str_address, virtual_address + offset, buf.len());
+
+            self.release(c_str_address);
 
             result.and(Ok(()))
         } else {
-            Err(Error::new(ENOENT))
+            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
+            Err(Error::new(EFAULT))
         }
     }
 
     fn unlink(&mut self, url: Url) -> Result<()> {
         let c_str = url.to_string() + "\0";
 
-        let mut physical_address = c_str.as_ptr() as usize;
-        if physical_address >= 0x80000000 {
-            physical_address -= 0x80000000;
-        }
+        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
 
-        let mut virtual_address = 0;
-        let virtual_size = c_str.len();
-        if let Some(scheme) = self.inner.upgrade() {
-            unsafe {
-                let mmap = &mut *(*scheme.context).mmap.get();
-                virtual_address = mmap.next_mem();
-                mmap.memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: virtual_size,
-                    writeable: false,
-                    allocated: false,
-                });
-            }
-        }
+        let result = self.call(SYS_UNLINK, virtual_address, 0, 0);
 
-        if virtual_address > 0 {
-            let result = self.call(SYS_UNLINK, virtual_address, 0, 0);
+        self.release(virtual_address);
 
-            if let Some(scheme) = self.inner.upgrade() {
-                unsafe {
-                    let mmap = &mut *(*scheme.context).mmap.get();
-                    if let Ok(mut mem) = mmap.get_mem_mut(virtual_address) {
-                        mem.virtual_size = 0;
-                    }
-                    mmap.clean_mem();
-                }
-            }
-
-            result.and(Ok(()))
-        } else {
-            Err(Error::new(ENOENT))
-        }
+        result.and(Ok(()))
     }
 }

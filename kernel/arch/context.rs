@@ -7,21 +7,22 @@ use arch::memory;
 use arch::paging::Page;
 use arch::regs::Regs;
 
+use collections::borrow::Cow;
 use collections::string::{String, ToString};
 use collections::vec::Vec;
 
 use common::time::Duration;
 
 use core::cell::UnsafeCell;
-use core::slice::{Iter, IterMut};
+use core::slice::{self, Iter, IterMut};
 use core::{mem, ptr};
 use core::ops::DerefMut;
 
 use fs::Resource;
 
-use syscall::{do_sys_exit, CLONE_FILES, CLONE_FS, CLONE_VM, CLONE_VFORK};
+use syscall;
 
-use system::error::{Error, Result, EBADF, EFAULT, ENOMEM, ESRCH};
+use system::error::{Error, Result, EBADF, EFAULT, ENOMEM, ESRCH, ENOENT, EINVAL};
 
 use sync::WaitMap;
 
@@ -55,8 +56,7 @@ impl ContextManager {
     }
 
     pub fn current(&self) -> Result<&Box<Context>> {
-        let i = self.i;
-        self.get(i)
+        self.get(self.i)
     }
 
     pub fn current_mut(&mut self) -> Result<&mut Box<Context>> {
@@ -73,19 +73,31 @@ impl ContextManager {
     }
 
     pub fn get(&self, i: usize) -> Result<&Box<Context>> {
-        if self.enabled {
-            self.inner.get(i).ok_or(Error::new(ESRCH))
-        } else{
-            Err(Error::new(ESRCH))
-        }
+        self.inner.get(i).ok_or(Error::new(ESRCH))
     }
 
     pub fn get_mut(&mut self, i: usize) -> Result<&mut Box<Context>> {
-        if self.enabled {
-            self.inner.get_mut(i).ok_or(Error::new(ESRCH))
-        } else{
-            Err(Error::new(ESRCH))
+        self.inner.get_mut(i).ok_or(Error::new(ESRCH))
+    }
+
+    /// Find a resource with a given PID.
+    pub fn find(&self, pid: usize) -> Result<&Box<Context>> {
+        for context in self.inner.iter() {
+            if context.pid == pid {
+                return Ok(context);
+            }
         }
+        Err(Error::new(ESRCH))
+    }
+
+    /// Find a resource with a given PID, and yield a mutable reference to it.
+    pub fn find_mut(&mut self, pid: usize) -> Result<&mut Box<Context>> {
+        for mut context in self.inner.iter_mut() {
+            if context.pid == pid {
+                return Ok(context);
+            }
+        }
+        Err(Error::new(ESRCH))
     }
 
     pub fn len(&self) -> usize {
@@ -131,7 +143,7 @@ pub unsafe fn context_switch() {
     let mut next_ptr: *mut Context = 0 as *mut Context;
 
     {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = &mut *::env().contexts.get();
         if contexts.enabled {
             let current_i = contexts.i;
             'searching: loop {
@@ -169,7 +181,7 @@ pub unsafe fn context_switch() {
                         if next.kernel_stack > 0 {
                             tss.sp0 = next.kernel_stack + CONTEXT_STACK_SIZE - 128;
                         } else {
-                            tss.sp0 = 0x200000 - 128;
+                            tss.sp0 = 0x800000 - 128;
                         }
                     }
 
@@ -187,7 +199,7 @@ pub unsafe fn context_switch() {
 }
 
 pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
-    let mut contexts = ::env().contexts.lock();
+    let contexts = &mut *::env().contexts.get();
     let flags = regs.bx;
 
     let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE + 512);
@@ -225,13 +237,17 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
                 exited: false,
                 switch: 0,
                 time: 0,
-                vfork: if flags & CLONE_VFORK == CLONE_VFORK {
+                vfork: if flags & syscall::CLONE_VFORK == syscall::CLONE_VFORK {
                     parent.blocked = true;
                     Some(parent.deref_mut())
                 } else {
                     None
                 },
                 wake: None,
+
+                supervised: flags & syscall::CLONE_SUPERVISE == syscall::CLONE_SUPERVISE,
+                blocked_syscall: false,
+                current_syscall: None,
 
                 kernel_stack: kernel_stack,
                 regs: kernel_regs,
@@ -257,33 +273,38 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
                 },
                 loadable: parent.loadable,
 
-                image: if flags & CLONE_VM == CLONE_VM {
+                image: if flags & syscall::CLONE_VM == syscall::CLONE_VM {
                     //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
 
                     parent.image.clone()
                 } else {
                     Arc::new(UnsafeCell::new((*parent.image.get()).dup()))
                 },
-                heap: if flags & CLONE_VM == CLONE_VM {
+                heap: if flags & syscall::CLONE_VM == syscall::CLONE_VM {
                     //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
 
                     parent.heap.clone()
                 } else {
                     Arc::new(UnsafeCell::new((*parent.heap.get()).dup()))
                 },
-                mmap: if flags & CLONE_VM == CLONE_VM {
+                mmap: if flags & syscall::CLONE_VM == syscall::CLONE_VM {
                     //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
 
                     parent.mmap.clone()
                 } else {
                     Arc::new(UnsafeCell::new((*parent.mmap.get()).dup()))
                 },
-                cwd: if flags & CLONE_FS == CLONE_FS {
+                env_vars: if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                    parent.env_vars.clone()
+                } else {
+                    Arc::new(UnsafeCell::new((*parent.env_vars.get()).clone()))
+                },
+                cwd: if flags & syscall::CLONE_FS == syscall::CLONE_FS {
                     parent.cwd.clone()
                 } else {
                     Arc::new(UnsafeCell::new((*parent.cwd.get()).clone()))
                 },
-                files: if flags & CLONE_FILES == CLONE_FILES {
+                files: if flags & syscall::CLONE_FILES == syscall::CLONE_FILES {
                     //debugln!("{}: {}: clone resources for {}", parent.pid, parent.name, clone_pid);
 
                     parent.files.clone()
@@ -311,7 +332,7 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
 
         contexts.push(context);
 
-        if flags & CLONE_VFORK == CLONE_VFORK {
+        if flags & syscall::CLONE_VFORK == syscall::CLONE_VFORK {
             context_switch();
         }
 
@@ -362,7 +383,7 @@ unsafe extern "cdecl" fn context_box(box_fn_ptr: usize) {
     let box_fn = ptr::read(box_fn_ptr as *mut Box<FnBox()>);
     memory::unalloc(box_fn_ptr);
     box_fn();
-    do_sys_exit(0);
+    syscall::process::exit(0);
 }
 
 /// Reads a Boxed function and executes it
@@ -374,7 +395,7 @@ unsafe extern "cdecl" fn context_box(/*Throw away extra params from ABI*/ _rdi: 
     let box_fn = ptr::read(box_fn_ptr as *mut Box<FnBox()>);
     memory::unalloc(box_fn_ptr);
     box_fn();
-    do_sys_exit(0);
+    syscall::process::exit(0);
 }
 
 pub struct ContextMemory {
@@ -492,10 +513,23 @@ impl ContextZone {
         return next_mem;
     }
 
+    /// Check permission of segment, if inside of mapped memory
+    pub fn permission(&self, ptr: usize, len: usize, writeable: bool) -> bool {
+        for mem in self.memory.iter() {
+            if ptr >= mem.virtual_address && ptr + len <= mem.virtual_address + mem.virtual_size {
+                if mem.writeable || ! writeable {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Translate to physical if a ptr is inside of the mapped memory
     pub fn translate(&self, ptr: usize, len: usize) -> Option<usize> {
         for mem in self.memory.iter() {
-            if ptr >= mem.virtual_address && ptr + len < mem.virtual_address + mem.virtual_size {
+            if ptr >= mem.virtual_address && ptr + len <= mem.virtual_address + mem.virtual_size {
                 return Some(ptr - mem.virtual_address + mem.physical_address);
             }
         }
@@ -543,14 +577,27 @@ impl ContextZone {
     }
 }
 
+#[derive(Clone)]
+pub struct EnvVar(pub String, pub String);
+
+impl EnvVar {
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    pub fn value(&self) -> &str {
+        &self.1
+    }
+}
+
 pub struct Context {
     // These members are used for control purposes by the scheduler {
-    // The PID of the context
+    /// The PID of the context
     pub pid: usize,
     /// The PID of the parent
     pub ppid: usize,
     /// The name of the context
-    pub name: String,
+    pub name: Cow<'static, str>,
     /// The I/O privilege level
     pub iopl: usize,
     /// Indicates that the context is blocked, and should not be switched to
@@ -566,6 +613,18 @@ pub struct Context {
     /// When to wake up
     pub wake: Option<Duration>,
     // }
+
+    /// Is this process supervised?
+    ///
+    /// i.e., will the syscalls made by this process block the process until handled by
+    /// a supervisor?
+    pub supervised: bool,
+    /// Is this process currently blocked by a syscall?
+    ///
+    /// This means that the process is waiting for the superviser to handle the syscall.
+    pub blocked_syscall: bool,
+    /// The current syscall
+    pub current_syscall: Option<(usize, usize, usize, usize, usize)>,
 
     // These members control the stack and registers and are unique to each context {
     // The kernel stack
@@ -587,6 +646,9 @@ pub struct Context {
     pub heap: Arc<UnsafeCell<ContextZone>>,
     /// Mmap memory, cloned for threads, copied or created for processes. Modified by mmap
     pub mmap: Arc<UnsafeCell<ContextZone>>,
+    /// Environment variables, cloned for threads, copied or created for
+    /// processes. Modified by set_env
+    pub env_vars: Arc<UnsafeCell<Vec<EnvVar>>>,
 
     /// Program working directory, cloned for threads, copied or created for processes. Modified by chdir
     pub cwd: Arc<UnsafeCell<String>>,
@@ -600,7 +662,7 @@ pub struct Context {
 
 impl Context {
     pub fn next_pid() -> usize {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = unsafe { &mut *::env().contexts.get() };
 
         let mut next_pid = contexts.next_pid;
 
@@ -634,7 +696,7 @@ impl Context {
         box Context {
             pid: Context::next_pid(),
             ppid: 0,
-            name: "kidle".to_string(),
+            name: "kidle".into(),
             iopl: 3,
             blocked: false,
             exited: false,
@@ -642,6 +704,10 @@ impl Context {
             time: 0,
             vfork: None,
             wake: None,
+
+            supervised: false,
+            blocked_syscall: false,
+            current_syscall: None,
 
             kernel_stack: 0,
             regs: Regs::default(),
@@ -652,6 +718,7 @@ impl Context {
             image: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE))),
             heap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE))),
             mmap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE))),
+            env_vars: Arc::new(UnsafeCell::new(Vec::new())),
 
             cwd: Arc::new(UnsafeCell::new(String::new())),
             files: Arc::new(UnsafeCell::new(Vec::new())),
@@ -660,7 +727,7 @@ impl Context {
         }
     }
 
-    pub unsafe fn new(name: String, call: usize, args: &Vec<usize>) -> Box<Self> {
+    pub unsafe fn new(name: Cow<'static, str>, call: usize, args: &Vec<usize>) -> Box<Self> {
         let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE + 512);
 
         let mut regs = Regs::default();
@@ -680,6 +747,10 @@ impl Context {
             vfork: None,
             wake: None,
 
+            supervised: false,
+            blocked_syscall: false,
+            current_syscall: None,
+
             kernel_stack: kernel_stack,
             regs: regs,
             fx: fx,
@@ -689,6 +760,7 @@ impl Context {
             image: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE))),
             heap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE))),
             mmap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE))),
+            env_vars: Arc::new(UnsafeCell::new(Vec::new())),
 
             cwd: Arc::new(UnsafeCell::new(String::new())),
             files: Arc::new(UnsafeCell::new(Vec::new())),
@@ -705,7 +777,7 @@ impl Context {
         ret
     }
 
-    pub fn spawn(name: String, box_fn: Box<FnBox()>) -> usize {
+    pub fn spawn(name: Cow<'static, str>, box_fn: Box<FnBox()>) -> usize {
         let ret;
 
         unsafe {
@@ -714,19 +786,20 @@ impl Context {
 
             let mut context_box_args: Vec<usize> = Vec::new();
             context_box_args.push(box_fn_ptr as usize);
-            context_box_args.push(0); //Return address, 0 catches bad code
+            context_box_args.push(0); // Return address, 0 catches bad code
 
             let context = Context::new(name, context_box as usize, &context_box_args);
 
             ret = context.pid;
 
-            ::env().contexts.lock().push(context);
+            (&mut *::env().contexts.get()).push(context);
         }
 
         ret
     }
 
     pub fn canonicalize(&self, path: &str) -> String {
+        // TODO my eyes burn, rewrite this.
         if path.find(':').is_none() {
             let cwd = unsafe { &*self.cwd.get() };
             if path == "." {
@@ -803,6 +876,53 @@ impl Context {
         ptr::write(self.regs.sp as *mut usize, data);
     }
 
+    /// Access a raw pointer safely
+    pub fn get_ref<'a, T>(&'a self, ptr: *const T) -> Result<&'a T> {
+        self.permission(ptr as usize, mem::size_of::<T>(), false)?;
+        Ok(unsafe { &*ptr })
+    }
+
+    /// Access a mutable raw pointer safely
+    pub fn get_ref_mut<'a, T>(&'a self, ptr: *mut T) -> Result<&'a mut T> {
+        self.permission(ptr as usize, mem::size_of::<T>(), true)?;
+        Ok(unsafe { &mut *ptr })
+    }
+
+    /// Access a raw pointer safely
+    pub fn get_slice<'a, T>(&'a self, ptr: *const T, len: usize) -> Result<&'a [T]> {
+        self.permission(ptr as usize, mem::size_of::<T>() * len, false)?;
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Access a mutable raw pointer safely
+    pub fn get_slice_mut<'a, T>(&'a self, ptr: *mut T, len: usize) -> Result<&'a mut [T]> {
+        self.permission(ptr as usize, mem::size_of::<T>() * len, true)?;
+        Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
+    }
+
+    /// Check permission of segment, if inside of mapped memory
+    pub fn permission(&self, ptr: usize, len: usize, writeable: bool) -> Result<()> {
+        if let Some(ref stack) = self.stack {
+            if ptr >= stack.virtual_address && ptr + len <= stack.virtual_address + stack.virtual_size {
+                return Ok(());
+            }
+        }
+
+        if unsafe { (*self.image.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        if unsafe { (*self.heap.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        if unsafe { (*self.mmap.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        Err(Error::new(EFAULT))
+    }
+
     /// Translate to physical if a ptr is inside of the mapped memory
     pub fn translate(&self, ptr: usize, len: usize) -> Result<usize> {
         if let Some(ref stack) = self.stack {
@@ -824,6 +944,50 @@ impl Context {
         }
 
         Err(Error::new(EFAULT))
+    }
+
+    /// Gets an environment variable. Returns `Err` if the variable is not
+    /// defined
+    pub fn get_env_var(&self, var_name: &str) -> Result<&str> {
+        for variable in unsafe { (*self.env_vars.get()).iter() } {
+            if variable.name() == var_name {
+                return Ok(variable.value());
+            }
+        }
+        Err(Error::new(ENOENT))
+    }
+
+    /// Sets an environment variable. Returns `Err` if the variable name contains the `=`
+    /// character
+    pub fn set_env_var(&mut self, name: &str, value: &str) -> Result<()> {
+        if name.contains('=') {
+            return Err(Error::new(EINVAL));
+        }
+
+        for mut variable in unsafe { (*self.env_vars.get()).iter_mut() } {
+            if variable.name() == name {
+                variable.0 = String::from(value);
+                return Ok(());
+            }
+        }
+        unsafe { (*self.env_vars.get()).push(EnvVar(String::from(name), String::from(value))) };
+        Ok(())
+    }
+
+    /// Returns a slice of the environment variables
+    pub fn list_env_vars(&self) -> &[EnvVar] {
+        unsafe { &*self.env_vars.get() }
+    }
+
+    /// Removes the environment variable named `name`. Returns `Err` if the variable doesn't exist
+    pub fn remove_env_var(&self, name: &str) -> Result<()> {
+        for (i, variable) in unsafe { (*self.env_vars.get()).iter().enumerate() } {
+            if variable.name() == name {
+                unsafe { (*self.env_vars.get()).remove(i) };
+                return Ok(());
+            }
+        }
+        Err(Error::new(ENOENT))
     }
 
     pub unsafe fn map(&mut self) {

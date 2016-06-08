@@ -1,3 +1,5 @@
+//! System calls for basic memory management.
+
 use arch::context::ContextMemory;
 use arch::memory;
 
@@ -5,10 +7,10 @@ use system::error::Result;
 
 //TODO: Refactor file to propogate results
 
-pub fn do_sys_brk(addr: usize) -> Result<usize> {
+pub fn brk(addr: usize) -> Result<usize> {
     let mut ret = 0;
 
-    let contexts = ::env().contexts.lock();
+    let contexts = unsafe { & *::env().contexts.get() };
     if let Ok(current) = contexts.current() {
         ret = unsafe { (*current.heap.get()).next_mem() };
 
@@ -25,7 +27,6 @@ pub fn do_sys_brk(addr: usize) -> Result<usize> {
                         mem.virtual_size = size;
                         ret = mem.virtual_address + mem.virtual_size;
                     } else {
-                        mem.virtual_size = 0;
                         debugln!("BRK: Realloc failed {:X}, {}\n", mem.virtual_address, size);
                     }
 

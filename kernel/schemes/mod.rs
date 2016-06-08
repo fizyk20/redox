@@ -2,10 +2,12 @@
 pub mod context;
 /// Debug scheme
 pub mod debug;
+/// Disk scheme
+pub mod disk;
 /// Display Scheme
 pub mod display;
-/// File scheme
-pub mod file;
+/// Environment variables scheme
+pub mod env;
 /// Init Filesystem
 pub mod initfs;
 /// Interrupt scheme
@@ -14,5 +16,7 @@ pub mod interrupt;
 pub mod memory;
 /// Pipes
 pub mod pipe;
+/// Logging scheme
+pub mod syslog;
 /// Tests
 pub mod test;

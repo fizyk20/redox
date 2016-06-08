@@ -1,12 +1,49 @@
-use core::str::StrExt;
+use core::fmt;
+use drivers::io::{Io, Pio};
 
-use syscall::do_sys_debug;
+pub struct SerialConsole {
+    status: Pio<u8>,
+    data: Pio<u8>
+}
+
+impl SerialConsole {
+    pub fn new() -> SerialConsole {
+        SerialConsole {
+            status: Pio::new(0x3F8 + 5),
+            data: Pio::new(0x3F8)
+        }
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes.iter() {
+            while !self.status.readf(0x20) {}
+            self.data.write(*byte);
+
+            if *byte == 8 {
+                while !self.status.readf(0x20) {}
+                self.data.write(0x20);
+
+                while !self.status.readf(0x20) {}
+                self.data.write(8);
+            }
+        }
+    }
+}
+
+impl fmt::Write for SerialConsole {
+    fn write_str(&mut self, s: &str) -> Result<(), fmt::Error> {
+        self.write(s.as_bytes());
+
+        Ok(())
+    }
+}
 
 /// Debug to console
 #[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => ({
-        $crate::common::debug::d(&format!($($arg)*));
+        use $crate::core::fmt::Write;
+        let _ = write!($crate::common::debug::SerialConsole::new(), $($arg)*);
     });
 }
 
@@ -15,74 +52,4 @@ macro_rules! debug {
 macro_rules! debugln {
     ($fmt:expr) => (debug!(concat!($fmt, "\n")));
     ($fmt:expr, $($arg:tt)*) => (debug!(concat!($fmt, "\n"), $($arg)*));
-}
-
-/// Emit a debug string via a syscall
-pub fn d(msg: &str) {
-    let _ = do_sys_debug(msg.as_ptr(), msg.len());
-}
-
-/// Emit a byte as a character to debug output
-pub fn db(byte: u8) {
-    let _ = do_sys_debug(&byte, 1);
-}
-
-/// Convert a nibble (4 bits) to hex (0-9, A-F)
-fn nibble_to_hex(nibble: u8) -> Option<u8> {
-    if nibble > 16 {
-        None
-    }
-    else if nibble <= 9 {
-        Some(nibble + ('0' as u8))
-    } 
-    else {
-        Some(nibble - 10 + ('A' as u8))
-    }
-}
-
-/// Emit a byte as hex to debug output
-pub fn dbh(byte: u8) {
-    // First handle the high 4 bits
-    let high = nibble_to_hex(byte / 16).unwrap();
-    db(high);
-
-    // then the low 4 bits
-    let low = nibble_to_hex(byte % 16).unwrap();
-    db(low);
-}
-
-/// Emit an usize as hex to debug output
-pub fn dh(num: usize) {
-    if num >= 256 {
-        dh(num / 256);
-    }
-    dbh((num % 256) as u8);
-}
-
-/// Emit an usize as decimal to debug output
-pub fn dd(num: usize) {
-    if num >= 10 {
-        dd(num / 10);
-    }
-    db('0' as u8 + (num % 10) as u8);
-}
-
-/// Emit an isize as decimal to debug output
-pub fn ds(num: isize) {
-    if num >= 0 {
-        dd(num as usize);
-    } else {
-        dc('-');
-        dd((-num) as usize);
-    }
-}
-
-/// Emit a character to debug output
-pub fn dc(character: char) {
-    db(character as u8);
-}
-
-/// Emit a newline to debug output
-pub fn dl() {
-    dc('\n');
 }

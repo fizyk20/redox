@@ -6,9 +6,8 @@ use collections::slice;
 use collections::vec::Vec;
 use collections::vec_deque::VecDeque;
 
+use core::cell::UnsafeCell;
 use core::ptr;
-
-use common::debug;
 
 use drivers::pci::config::PciConfig;
 
@@ -18,8 +17,6 @@ use network::scheme::*;
 use fs::{KScheme, Resource, Url};
 
 use system::error::Result;
-
-use sync::Intex;
 
 const CTRL: u32 = 0x00;
 const CTRL_LRST: u32 = 1 << 3;
@@ -110,7 +107,7 @@ pub struct Intel8254x {
     pub base: usize,
     pub memory_mapped: bool,
     pub irq: u8,
-    pub resources: Intex<Vec<*mut NetworkResource>>,
+    pub resources: UnsafeCell<Vec<*mut NetworkResource>>,
     pub inbound: VecDeque<Vec<u8>>,
     pub outbound: VecDeque<Vec<u8>>,
 }
@@ -135,11 +132,11 @@ impl KScheme for Intel8254x {
 
 impl NetworkScheme for Intel8254x {
     fn add(&mut self, resource: *mut NetworkResource) {
-        self.resources.lock().push(resource);
+        unsafe { &mut *self.resources.get() }.push(resource);
     }
 
     fn remove(&mut self, resource: *mut NetworkResource) {
-        let mut resources = self.resources.lock();
+        let mut resources = unsafe { &mut *self.resources.get() };
 
         let mut i = 0;
         while i < resources.len() {
@@ -161,28 +158,26 @@ impl NetworkScheme for Intel8254x {
     }
 
     fn sync(&mut self) {
-        unsafe {
-            {
-                let resources = self.resources.lock();
+        {
+            let resources = unsafe { &mut *self.resources.get() };
 
-                for resource in resources.iter() {
-                    while let Some(bytes) = (**resource).outbound.lock().pop_front() {
-                        self.outbound.push_back(bytes);
-                    }
+            for resource in resources.iter() {
+                while let Some(bytes) = unsafe { &mut *(**resource).outbound.get() }.pop_front() {
+                    self.outbound.push_back(bytes);
                 }
             }
+        }
 
-            self.send_outbound();
+        unsafe { self.send_outbound(); }
 
-            self.receive_inbound();
+        unsafe { self.receive_inbound(); }
 
-            {
-                let resources = self.resources.lock();
+        {
+            let resources = unsafe { &mut *self.resources.get() };
 
-                while let Some(bytes) = self.inbound.pop_front() {
-                    for resource in resources.iter() {
-                        (**resource).inbound.lock().push_back(bytes.clone());
-                    }
+            while let Some(bytes) = self.inbound.pop_front() {
+                for resource in resources.iter() {
+                    unsafe { (**resource).inbound.send(bytes.clone()) };
                 }
             }
         }
@@ -198,7 +193,7 @@ impl Intel8254x {
             base: base & 0xFFFFFFF0,
             memory_mapped: base & 1 == 0,
             irq: pci.read(0x3C) as u8 & 0xF,
-            resources: Intex::new(Vec::new()),
+            resources: UnsafeCell::new(Vec::new()),
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
         };
@@ -215,18 +210,7 @@ impl Intel8254x {
         for tail in 0..length / 16 {
             let rd = &mut *receive_ring.offset(tail as isize);
             if rd.status & RD_DD == RD_DD {
-                debug::d("Recv ");
-                debug::dh(rd as *mut Rd as usize);
-                debug::d(" ");
-                debug::dh(rd.status as usize);
-                debug::d(" ");
-                debug::dh(rd.buffer as usize);
-                debug::d(" ");
-                debug::dh(rd.length as usize);
-                debug::dl();
-
-                self.inbound.push_back(Vec::from(slice::from_raw_parts(rd.buffer as *const u8,
-                                                                       rd.length as usize)));
+                self.inbound.push_back(Vec::from(slice::from_raw_parts(rd.buffer as *const u8, rd.length as usize)));
 
                 rd.status = 0;
             }
@@ -252,16 +236,6 @@ impl Intel8254x {
                     if bytes.len() < 16384 {
                         let td = &mut *transmit_ring.offset(old_tail as isize);
 
-                        debug::d("Send ");
-                        debug::dh(old_tail as usize);
-                        debug::d(" ");
-                        debug::dh(td.status as usize);
-                        debug::d(" ");
-                        debug::dh(td.buffer as usize);
-                        debug::d(" ");
-                        debug::dh(bytes.len() & 0x3FFF);
-                        debug::dl();
-
                         ::memcpy(td.buffer as *mut u8, bytes.as_ptr(), bytes.len());
                         td.length = (bytes.len() & 0x3FFF) as u16;
                         td.cso = 0;
@@ -273,10 +247,7 @@ impl Intel8254x {
                         self.write(TDT, tail);
                     } else {
                         // TODO: More than one TD
-                        debug::dl();
-                        debug::d("Intel 8254x: Frame too long for transmit: ");
-                        debug::dd(bytes.len());
-                        debug::dl();
+                        debugln!("Intel 8254x: Frame too long for transmit: {}", bytes.len());
                     }
 
                     break;
@@ -311,7 +282,7 @@ impl Intel8254x {
     }
 
     pub unsafe fn init(&mut self) {
-        debugln!(" + Intel 8254x on: {:X}, IRQ: {:X}", self.base, self.irq);
+        debug!(" + Intel 8254x on: {:X}, IRQ: {:X}", self.base, self.irq);
 
         self.pci.flag(4, 4, true); // Bus mastering
 
@@ -330,12 +301,8 @@ impl Intel8254x {
         // Do not use VLANs
         self.flag(CTRL, CTRL_VME, false);
 
-        debug::d(" CTRL ");
-        debug::dh(self.read(CTRL) as usize);
-
         // TODO: Clear statistical counters
 
-        debug::d(" MAC: ");
         let mac_low = self.read(RAL0);
         let mac_high = self.read(RAH0);
         MAC_ADDR = MacAddr {
@@ -346,7 +313,7 @@ impl Intel8254x {
                     mac_high as u8,
                     (mac_high >> 8) as u8],
         };
-        debug::d(&MAC_ADDR.to_string());
+        debugln!(" MAC: {}", &MAC_ADDR.to_string());
 
         //
         // MTA => 0;
@@ -397,11 +364,7 @@ impl Intel8254x {
         self.write(TDH, 0);
         self.write(TDT, 0);
 
-        self.write(IMS,
-                   IMS_RXT | IMS_RX | IMS_RXDMT | IMS_RXSEQ | IMS_LSC | IMS_TXQE | IMS_TXDW);
-
-        debug::d(" IMS ");
-        debug::dh(self.read(IMS) as usize);
+        self.write(IMS, IMS_RXT | IMS_RX | IMS_RXDMT | IMS_RXSEQ | IMS_LSC | IMS_TXQE | IMS_TXDW);
 
         self.flag(RCTL, RCTL_EN, true);
         self.flag(RCTL, RCTL_UPE, true);
@@ -416,19 +379,11 @@ impl Intel8254x {
         self.flag(RCTL, RCTL_BSEX, true);
         self.flag(RCTL, RCTL_SECRC, true);
 
-        debug::d(" RCTL ");
-        debug::dh(self.read(RCTL) as usize);
-
         self.flag(TCTL, TCTL_EN, true);
         self.flag(TCTL, TCTL_PSP, true);
         // TCTL.CT = Collition threshold
         // TCTL.COLD = Collision distance
         // TIPG Packet Gap
         // TODO ...
-
-        debug::d(" TCTL ");
-        debug::dh(self.read(TCTL) as usize);
-
-        debug::dl();
     }
 }

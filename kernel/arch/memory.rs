@@ -4,13 +4,15 @@ use core::{cmp, intrinsics, mem};
 use core::ops::{Index, IndexMut};
 use core::{ptr, slice};
 
+use system::error::{Result, Error, ENOMEM};
+
 use super::paging::{Page, PAGE_END};
 
 pub const CLUSTER_ADDRESS: usize = PAGE_END;
 pub const CLUSTER_COUNT: usize = 1024 * 1024; // 4 GiB
 pub const CLUSTER_SIZE: usize = 4096; // Of 4 K chunks
 
-use system::error::{Result, Error, ENOMEM};
+pub const LOGICAL_OFFSET: usize = 0x80000000;
 
 /// A wrapper around raw pointers
 pub struct Memory<T> {
@@ -273,7 +275,7 @@ pub unsafe fn alloc_aligned(size: usize, align: usize) -> usize {
 
                 let mut page = Page::new(cluster_address);
                 let old = page.entry_data();
-                page.map_kernel_write(address);
+                page.map_kernel_write(cluster_address);
 
                 ::memset(cluster_address as *mut u8, 0, CLUSTER_SIZE);
 

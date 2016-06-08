@@ -8,6 +8,15 @@ pub const SYS_CLONE: usize = 120;
     pub const CLONE_FS: usize = 0x200;
     pub const CLONE_FILES: usize = 0x400;
     pub const CLONE_VFORK: usize = 0x4000;
+    /// Mark this clone as supervised.
+    ///
+    /// This means that the process can run in supervised mode, even not being connected to
+    /// a supervisor yet. In other words, the parent can later on supervise the process and handle
+    /// the potential blocking syscall.
+    ///
+    /// This is an important security measure, since otherwise the process would be able to fork it
+    /// self right after starting, making supervising it impossible.
+    pub const CLONE_SUPERVISE: usize = 0x400000;
 pub const SYS_CLOSE: usize = 6;
 pub const SYS_CLOCK_GETTIME: usize = 265;
     pub const CLOCK_REALTIME: usize = 1;
@@ -55,8 +64,17 @@ pub const SYS_YIELD: usize = 158;
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(packed)]
 pub struct Stat {
+    pub st_dev: u16,
+    pub st_ino: u16,
     pub st_mode: u16,
-    pub st_size: u64
+    pub st_nlink: u16,
+    pub st_uid: u16,
+    pub st_gid: u16,
+    pub st_rdev: u16,
+    pub st_size: u32,
+    pub st_atime: u32,
+    pub st_mtime: u32,
+    pub st_ctime: u32
 }
 
 #[derive(Copy, Clone, Debug, Default)]

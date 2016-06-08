@@ -1,5 +1,7 @@
 use std::{cmp, mem};
+use std::path::Path;
 
+use orbimage;
 use system::graphics::{fast_copy, fast_set};
 
 use super::{Color, Rect};
@@ -165,15 +167,7 @@ impl Image {
     }
 
     pub fn from_color(width: i32, height: i32, color: Color) -> Image {
-        let mut data: Vec<u32> = Vec::new();
-        {
-            let size = width as usize * height as usize;
-            while data.len() < size {
-                data.push(color.data);
-            }
-        }
-
-        Image::from_data(width, height, data.into_boxed_slice())
+        Image::from_data(width, height, vec![color.data; width as usize * height as usize].into_boxed_slice())
     }
 
     pub fn from_data(width: i32, height: i32, data: Box<[u32]>) -> Image {
@@ -181,6 +175,21 @@ impl Image {
             w: width,
             h: height,
             data: data
+        }
+    }
+
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Image {
+        match orbimage::Image::from_path(path) {
+            Ok(orb_image) => {
+                let width = orb_image.width();
+                let height = orb_image.height();
+                let data = orb_image.into_data();
+                Image::from_data(width as i32, height as i32, unsafe { mem::transmute(data) })
+            },
+            Err(err) => {
+                println!("orbital Image::from_path: {}", err);
+                Image::new(0, 0)
+            }
         }
     }
 

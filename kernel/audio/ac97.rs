@@ -3,37 +3,40 @@ use alloc::boxed::Box;
 use arch::context::context_switch;
 use arch::memory;
 
-use core::{cmp, ptr, mem};
+use core::{cmp, mem};
 
 use common::time;
 
 use drivers::pci::config::PciConfig;
-use drivers::io::{Io, Pio};
+use drivers::io::{Io, Mmio, Pio, PhysAddr};
 
 use fs::{KScheme, Resource, Url};
 
-use syscall::{do_sys_nanosleep, Result, TimeSpec};
+use syscall;
+use syscall::TimeSpec;
 
 #[repr(packed)]
-struct BD {
-    ptr: u32,
-    samples: u32,
+struct Bd {
+    ptr: PhysAddr<Mmio<u32>>,
+    samples: Mmio<u32>,
 }
 
 struct Ac97Resource {
     audio: usize,
     bus_master: usize,
+    bdl: *mut Bd,
 }
 
 impl Resource for Ac97Resource {
-    fn dup(&self) -> Result<Box<Resource>> {
+    fn dup(&self) -> syscall::Result<Box<Resource>> {
         Ok(box Ac97Resource {
             audio: self.audio,
             bus_master: self.bus_master,
+            bdl: self.bdl
         })
     }
 
-    fn path(&self, buf: &mut [u8]) -> Result <usize> {
+    fn path(&self, buf: &mut [u8]) -> syscall::Result <usize> {
         let path = b"audio:";
 
         let mut i = 0;
@@ -45,7 +48,7 @@ impl Resource for Ac97Resource {
         Ok(i)
     }
 
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> syscall::Result<usize> {
         unsafe {
             let audio = self.audio as u16;
 
@@ -57,7 +60,6 @@ impl Resource for Ac97Resource {
 
             let bus_master = self.bus_master as u16;
 
-            let mut po_bdbar = Pio::<u32>::new(bus_master + 0x10);
             let po_civ = Pio::<u8>::new(bus_master + 0x14);
             let mut po_lvi = Pio::<u8>::new(bus_master + 0x15);
             let mut po_cr = Pio::<u8>::new(bus_master + 0x1B);
@@ -71,18 +73,9 @@ impl Resource for Ac97Resource {
 
             po_cr.write(0);
 
-            let mut bdl = po_bdbar.read() as *mut BD;
-            if bdl as usize == 0 {
-                bdl = memory::alloc(32 * mem::size_of::<BD>()) as *mut BD;
-                po_bdbar.write(bdl as u32);
-            }
-
             for i in 0..32 {
-                ptr::write(bdl.offset(i),
-                           BD {
-                               ptr: 0,
-                               samples: 0,
-                           });
+                (*self.bdl.offset(i)).ptr.write(0);
+                (*self.bdl.offset(i)).samples.write(0);
             }
 
             let mut wait = false;
@@ -115,7 +108,7 @@ impl Resource for Ac97Resource {
                         tv_sec: 0,
                         tv_nsec: 0,
                     };
-                    try!(do_sys_nanosleep(&req, &mut rem));
+                    try!(syscall::time::nanosleep(&req, &mut rem));
                 }
 
                 debug!("{} / {}: {} / {}\n",
@@ -127,11 +120,8 @@ impl Resource for Ac97Resource {
                 let bytes = cmp::min(65534 * 2, (buf.len() - position + 1));
                 let samples = bytes / 2;
 
-                ptr::write(bdl.offset(lvi as isize),
-                           BD {
-                               ptr: buf.as_ptr().offset(position as isize) as u32,
-                               samples: (samples & 0xFFFF) as u32,
-                           });
+                (*self.bdl.offset(lvi as isize)).ptr.write(buf.as_ptr().offset(position as isize) as u32);
+                (*self.bdl.offset(lvi as isize)).samples.write((samples & 0xFFFF) as u32);
 
                 position += bytes;
 
@@ -169,7 +159,7 @@ impl Resource for Ac97Resource {
                     tv_sec: 0,
                     tv_nsec: 0,
                 };
-                try!(do_sys_nanosleep(&req, &mut rem));
+                try!(syscall::time::nanosleep(&req, &mut rem));
             }
 
             debug!("Finished {} / {}\n", po_civ.read(), lvi);
@@ -180,9 +170,10 @@ impl Resource for Ac97Resource {
 }
 
 pub struct Ac97 {
-    pub audio: usize,
-    pub bus_master: usize,
-    pub irq: u8,
+    audio: usize,
+    bus_master: usize,
+    irq: u8,
+    bdl: *mut Bd,
 }
 
 impl KScheme for Ac97 {
@@ -190,10 +181,11 @@ impl KScheme for Ac97 {
         "audio"
     }
 
-    fn open(&mut self, _: Url, _: usize) -> Result<Box<Resource>> {
+    fn open(&mut self, _: Url, _: usize) -> syscall::Result<Box<Resource>> {
         Ok(box Ac97Resource {
             audio: self.audio,
             bus_master: self.bus_master,
+            bdl: self.bdl
         })
     }
 
@@ -212,9 +204,13 @@ impl Ac97 {
             audio: pci.read(0x10) as usize & 0xFFFFFFF0,
             bus_master: pci.read(0x14) as usize & 0xFFFFFFF0,
             irq: pci.read(0x3C) as u8 & 0xF,
+            bdl: memory::alloc(32 * mem::size_of::<Bd>()) as *mut Bd,
         };
 
         debug!(" + AC97 on: {:X}, {:X}, IRQ: {:X}\n", module.audio, module.bus_master, module.irq);
+
+        let mut po_bdbar = PhysAddr::new(Pio::<u32>::new(module.bus_master as u16 + 0x10));
+        po_bdbar.write(module.bdl as u32);
 
         module
     }

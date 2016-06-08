@@ -1,5 +1,3 @@
-; The bootloader
-
 ORG 0x7C00
 SECTION .text
 USE16
@@ -27,12 +25,12 @@ boot: ; dl comes with disk
     call print_num
     call print_line
 
-    mov ax, (fs_header - boot)/512  ; sector number of the filesystem header
-    mov bx, fs_header   ; address where filesystem header will be loaded
-    mov cx, (startup_end - fs_header)/512   ; size of data to be read in sectors (header + startup + kernel + fonts)
+    mov ax, (startup_start - boot) / 512  ; sector number of the filesystem header
+    mov bx, startup_start   ; address where filesystem header will be loaded
+    mov cx, (startup_end - startup_start) / 512   ; size of data to be read in sectors (header + startup + kernel + fonts)
     xor dx, dx  ; set dx to 0
     call load
-    ; now the filesystem data and kernel are loaded at 0:[fs_header]
+    ; now the filesystem data and kernel are loaded at 0:[startup_start]
 
     ; print "Finished"
     mov si, finished

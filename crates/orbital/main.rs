@@ -2,11 +2,12 @@
 #![feature(const_fn)]
 
 extern crate core;
+extern crate orbimage;
 extern crate system;
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::io::{Read, Write, SeekFrom};
+use std::io::SeekFrom;
 use std::mem;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -25,11 +26,9 @@ pub use self::rect::Rect;
 pub use self::socket::Socket;
 pub use self::window::Window;
 
-use self::bmp::BmpFile;
 use self::config::Config;
 use self::event::{EVENT_KEY, EVENT_MOUSE, QuitEvent};
 
-pub mod bmp;
 pub mod color;
 pub mod config;
 #[path="../../kernel/common/event.rs"]
@@ -81,8 +80,8 @@ impl OrbitalScheme {
         OrbitalScheme {
             start: Instant::now(),
             image: Image::new(width, height),
-            background: BmpFile::from_path(&config.background),
-            cursor: BmpFile::from_path(&config.cursor),
+            background: Image::from_path(&config.background),
+            cursor: Image::from_path(&config.cursor),
             cursor_x: 0,
             cursor_y: 0,
             dragging: false,
@@ -96,6 +95,14 @@ impl OrbitalScheme {
             redraws: vec![Rect::new(0, 0, width, height)],
             todo: Vec::new()
         }
+    }
+
+    fn background_rect(&self) -> Rect {
+        let w = self.background.width();
+        let h = self.background.height();
+        let x = self.image.width()/2 - w/2;
+        let y = self.image.height()/2 - h/2;
+        Rect::new(x, y, w, h)
     }
 
     fn cursor_rect(&self) -> Rect {
@@ -116,8 +123,14 @@ impl OrbitalScheme {
             *rect = rect.intersection(&screen_rect);
 
             if ! rect.is_empty() {
-                //TODO: Allow background to have different size: self.image.roi(&rect).set(Color::rgb(75, 163, 253));
-                self.image.roi(&rect).blit(&self.background.roi(rect));
+                //TODO: only clear area not covered by background
+                self.image.roi(&rect).set(Color::rgb(75, 163, 253));
+
+                let background_rect = self.background_rect();
+                let background_intersect = rect.intersection(&background_rect);
+                if ! background_intersect.is_empty(){
+                    self.image.roi(&background_intersect).blit(&self.background.roi(&background_intersect.offset(-background_rect.left(), -background_rect.top())));
+                }
 
                 let mut i = self.order.len();
                 for id in self.order.iter().rev() {
@@ -267,7 +280,7 @@ impl OrbitalScheme {
 
 impl Scheme for OrbitalScheme {
     fn open(&mut self, url: &str, _flags: usize, _mode: usize) -> Result<usize> {
-        let path = url.split(":").last().unwrap_or("");
+        let path = url.splitn(2, ":").last().unwrap_or("");
         let mut parts = path.split("/");
 
         let flags = parts.next().unwrap_or("");
